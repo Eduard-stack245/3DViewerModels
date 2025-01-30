@@ -1,7 +1,6 @@
-[gd_scene load_steps=3 format=3 uid="uid://cj17mi4hgee02"]
+[gd_scene load_steps=2 format=3 uid="uid://cj17mi4hgee02"]
 
 [ext_resource type="Script" path="res://main.gd" id="1_hjdc6"]
-[ext_resource type="Script" path="res://view_model.gd" id="2_wd474"]
 
 [node name="Control" type="Control"]
 layout_mode = 3
@@ -46,18 +45,14 @@ size_flags_vertical = 2
 [node name="SubViewportContainer" type="SubViewportContainer" parent="HSplitContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
-script = ExtResource("2_wd474")
 
 [node name="SubViewport" type="SubViewport" parent="HSplitContainer/SubViewportContainer"]
-unique_name_in_owner = true
 handle_input_locally = false
 size = Vector2i(540, 600)
 render_target_update_mode = 4
 
 [node name="Camera3D" type="Camera3D" parent="HSplitContainer/SubViewportContainer/SubViewport"]
-unique_name_in_owner = true
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="HSplitContainer/SubViewportContainer/SubViewport"]
 
 [node name="FileDialog" type="FileDialog" parent="."]
-size = Vector2i(303, 180)
