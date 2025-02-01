@@ -15,6 +15,9 @@ var orbit_center := Vector3.ZERO       # Центр вращения
 var dragging := false                  # Флаг перетаскивания
 var is_rotating := true                # Автовращение
 var mouse_in_viewport := false
+var auto_rotation_speed := 0.5  # Скорость автовращения
+var initial_auto_rotation_speed := 0.5  # Начальная скорость для восстановления
+var saved_settings_loaded := false
 
 func _ready():
 	print("Начало инициализации просмотрщика моделей")
@@ -22,30 +25,70 @@ func _ready():
 	setup_preview_camera()
 	setup_light()
 
-	# Добавляем обработчик для SubViewportContainer
 	mouse_entered.connect(_on_viewport_mouse_entered)
 	mouse_exited.connect(_on_viewport_mouse_exited)
 	
+	# Устанавливаем начальные значения вращения
+	is_rotating = true  # Автовращение включено по умолчанию
+	auto_rotation_speed = owner.settings.get_setting("rotation_speed")
+	initial_auto_rotation_speed = auto_rotation_speed
+	
 func _process(delta: float) -> void:
-	if current_model and is_rotating and !dragging and mouse_in_viewport:
-		camera_horizontal_angle += delta * 0.5
+	if current_model and is_rotating and !dragging:
+		# Прямое вращение без плавности для отладки
+		camera_horizontal_angle += delta * auto_rotation_speed
 		update_camera_position()
+		print("Rotating: angle=", camera_horizontal_angle, " speed=", auto_rotation_speed)
+		
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
+		owner.settings.set_setting("camera_vertical_angle", camera_vertical_angle)
 
 func load_in_preview_portal(model_path):
+	print("Loading model from path:", model_path)
 	clear_model()
 	var model = load_model_from_path(model_path)
 	if model:
 		current_model = model
 		preview_viewport.add_child(current_model)
+		print("Model loaded successfully")
+		
+		# Загружаем сохраненные настройки камеры
+		if !saved_settings_loaded:
+			print("Loading saved camera settings...")
+			camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
+			camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
+			camera_distance = owner.settings.get_setting("camera_distance")
+			auto_rotation_speed = owner.settings.get_setting("rotation_speed")
+			initial_auto_rotation_speed = auto_rotation_speed
+			saved_settings_loaded = true
 			
-		# Сбрасываем позицию камеры
-		camera_horizontal_angle = 0.0
-		camera_vertical_angle = PI/4
+			# Всегда включаем автовращение при первой загрузке
+			is_rotating = true
+		else:
+			# При загрузке последующих моделей сохраняем текущий угол поворота
+			print("Using current camera angles")
+		
+		print("Camera settings:")
+		print("- Horizontal angle:", camera_horizontal_angle)
+		print("- Vertical angle:", camera_vertical_angle)
+		print("- Distance:", camera_distance)
+		print("- Auto rotation:", is_rotating)
+		print("- Rotation speed:", auto_rotation_speed)
+		
 		orbit_center = Vector3.ZERO
-			
 		center_camera_on_model()
+		update_camera_position()
+		
+		# Сохраняем настройки
+		if owner and owner.settings:
+			owner.settings.set_setting("auto_rotation", is_rotating)
+			owner.settings.set_setting("rotation_speed", auto_rotation_speed)
+		
 		return "Модель загружена успешно"
 	else:
+		print("Failed to load model")
 		return "Ошибка загрузки модели"
 
 func load_model_from_path(path: String) -> Node3D:
@@ -130,6 +173,14 @@ func _input(event: InputEvent) -> void:
 	if !current_model:
 		return
 		
+	if event.is_action_pressed("toggle_rotation"):
+		print("Space pressed in view_model.gd")
+		toggle_rotation()
+		get_viewport().set_input_as_handled()
+		
+	if !mouse_in_viewport:
+		return
+		
 	if event is InputEventMouseButton:
 		print("Mouse button event: ", event.button_index, " pressed: ", event.pressed)
 		
@@ -138,25 +189,31 @@ func _input(event: InputEvent) -> void:
 			if is_dragging:
 				last_mouse_position = event.position
 				print("Started dragging at: ", last_mouse_position)
-				is_rotating = false  # Отключаем автовращение
+				# Временно останавливаем вращение при перетаскивании
+				if is_rotating:
+					auto_rotation_speed = 0.0
 			else:
 				print("Stopped dragging")
+				# Восстанавливаем вращение после перетаскивания
+				if is_rotating:
+					auto_rotation_speed = initial_auto_rotation_speed
 				
-		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
+		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and mouse_in_viewport:
 			var model_size = get_model_size()
 			camera_distance = max(model_size * 0.5, camera_distance * 0.9)
 			update_camera_position()
+			get_viewport().set_input_as_handled()
 			
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and mouse_in_viewport:
 			var model_size = get_model_size()
 			camera_distance = min(model_size * 10.0, camera_distance * 1.1)
 			update_camera_position()
+			get_viewport().set_input_as_handled()
 			
 	elif event is InputEventMouseMotion and is_dragging:
 		var delta = event.position - last_mouse_position
 		print("Mouse delta: ", delta)
 		
-		# Обновляем углы камеры
 		camera_horizontal_angle -= delta.x * 0.005
 		camera_vertical_angle = clamp(
 			camera_vertical_angle - delta.y * 0.005,
@@ -168,10 +225,9 @@ func _input(event: InputEvent) -> void:
 		last_mouse_position = event.position
 		update_camera_position()
 
-
+# Обновляем функцию _unhandled_input
 func _unhandled_input(event: InputEvent) -> void:
-	if !current_model:
-		print("No current model, ignoring input")
+	if !current_model or !mouse_in_viewport:  # Проверяем наличие модели и положение мыши
 		return
 	
 	if event is InputEventMouseButton:
@@ -183,39 +239,40 @@ func _unhandled_input(event: InputEvent) -> void:
 				if dragging:
 					print("Setting mouse mode to confined")
 					Input.mouse_mode = Input.MOUSE_MODE_CONFINED
-					is_rotating = false  # Отключаем автовращение при начале перетаскивания
+					is_rotating = false
 				else:
 					print("Setting mouse mode to visible")
 					Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 					
 			MOUSE_BUTTON_WHEEL_UP:
-				print("Mouse wheel up")
-				var model_size = get_model_size()
-				var min_distance = model_size * 0.5
-				camera_distance = max(min_distance, camera_distance * 0.9)
-				update_camera_position()
+				if mouse_in_viewport:  # Дополнительная проверка для колеса мыши
+					print("Mouse wheel up")
+					var model_size = get_model_size()
+					var min_distance = model_size * 0.5
+					camera_distance = max(min_distance, camera_distance * 0.9)
+					update_camera_position()
+					get_viewport().set_input_as_handled()  # Помечаем событие как обработанное
 			
 			MOUSE_BUTTON_WHEEL_DOWN:
-				print("Mouse wheel down")
-				var model_size = get_model_size()
-				var max_distance = model_size * 10.0
-				camera_distance = min(max_distance, camera_distance * 1.1)
-				update_camera_position()
+				if mouse_in_viewport:  # Дополнительная проверка для колеса мыши
+					print("Mouse wheel down")
+					var model_size = get_model_size()
+					var max_distance = model_size * 10.0
+					camera_distance = min(max_distance, camera_distance * 1.1)
+					update_camera_position()
+					get_viewport().set_input_as_handled()  # Помечаем событие как обработанное
 	
 	elif event is InputEventMouseMotion:
 		if dragging:
 			print("Mouse motion while dragging: ", event.relative)
-			# Устанавливаем меньшую чувствительность для более плавного вращения
 			camera_sensitivity = 0.003
 			
-			# Горизонтальное вращение
 			camera_horizontal_angle -= event.relative.x * camera_sensitivity
 			
-			# Вертикальное вращение с ограничениями
 			camera_vertical_angle = clamp(
 				camera_vertical_angle - event.relative.y * camera_sensitivity,
-				0.1,  # Минимальный угол (почти 0 градусов)
-				PI - 0.1  # Максимальный угол (почти 180 градусов)
+				0.1,
+				PI - 0.1
 			)
 			
 			print("Camera angles - Horizontal: ", camera_horizontal_angle, " Vertical: ", camera_vertical_angle)
@@ -259,6 +316,24 @@ func get_model_size() -> float:
 		return max(aabb.size.x, max(aabb.size.y, aabb.size.z))
 	return 5.0  # Значение по умолчанию
 
+func toggle_rotation() -> void:
+	print("Toggle rotation called")
+	is_rotating = !is_rotating
+	
+	if is_rotating:
+		print("Enabling rotation with speed:", initial_auto_rotation_speed)
+		auto_rotation_speed = initial_auto_rotation_speed
+	else:
+		print("Disabling rotation")
+		auto_rotation_speed = 0.0
+		
+	if owner and owner.settings:
+		owner.settings.set_setting("auto_rotation", is_rotating)
+		owner.settings.set_setting("rotation_speed", initial_auto_rotation_speed)
+	
+	print("Rotation state:", "ON" if is_rotating else "OFF")
+	print("Current speed:", auto_rotation_speed)
+
 func _init_camera_controls() -> void:
 	last_mouse_position = Vector2.ZERO
 	is_dragging = false
@@ -280,6 +355,11 @@ func update_camera_position() -> void:
 	
 	preview_camera.global_position = new_position
 	preview_camera.look_at(orbit_center)
+	
+	if owner and owner.settings:
+		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
+		owner.settings.set_setting("camera_vertical_angle", camera_vertical_angle)
+		owner.settings.set_setting("camera_distance", camera_distance)
 
 func center_camera_on_model() -> void:
 	if !current_model:
@@ -304,10 +384,11 @@ func center_camera_on_model() -> void:
 		var model_size = max(aabb.size.x, max(aabb.size.y, aabb.size.z))
 		orbit_center = aabb.get_center()
 		
-		# Настраиваем начальную позицию камеры
-		camera_horizontal_angle = 0.0
-		camera_vertical_angle = PI/4  # 45 градусов
-		camera_distance = model_size * 2.0  # Расстояние зависит от размера модели
+		# Устанавливаем начальные значения только если это первая загрузка
+		if !saved_settings_loaded:
+			camera_horizontal_angle = 0.0
+			camera_vertical_angle = PI/4  # 45 градусов
+			camera_distance = model_size * 2.0  # Расстояние зависит от размера модели
 		
 		# Центрируем модель
 		current_model.global_position = -orbit_center
@@ -315,8 +396,11 @@ func center_camera_on_model() -> void:
 		
 		update_camera_position()
 		
-		print("Model size: ", model_size)
-		print("Initial camera distance: ", camera_distance)
+		print("Model centered. Size:", model_size)
+		print("Camera settings after centering:")
+		print("- Horizontal angle:", camera_horizontal_angle)
+		print("- Vertical angle:", camera_vertical_angle)
+		print("- Distance:", camera_distance)
 
 func setup_preview_camera() -> void:
 	if !preview_camera:
