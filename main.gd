@@ -10,6 +10,7 @@ extends Control
 var model_paths: Array[String] = []
 var file_dialog: FileDialog
 var loading_dialog: AcceptDialog
+const SUPPORTED_EXTENSIONS = ["glb", "gltf", "obj"]
 
 func _ready():
 	add_child(settings)
@@ -165,6 +166,7 @@ func _on_project_dir_selected(dir: String) -> void:
 	viewport_container.clear_model()
 	scan_project_models(dir)
 
+# Обновим функцию scan_project_models:
 func scan_project_models(path: String) -> void:
 	var dir = DirAccess.open(path)
 	if !dir:
@@ -181,7 +183,7 @@ func scan_project_models(path: String) -> void:
 			scan_project_models(full_path)
 		else:
 			var extension = file_name.get_extension().to_lower()
-			if extension in ["glb", "gltf"]:
+			if extension in ["glb", "gltf", "obj"]:  # Добавили "obj"
 				print("Найдена модель: ", full_path)
 				model_paths.append(full_path)
 				model_list.add_item(file_name)
