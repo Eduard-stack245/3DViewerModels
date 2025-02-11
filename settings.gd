@@ -8,7 +8,13 @@ const DEFAULT_SETTINGS = {
 	"rotation_speed": 0.5,
 	"camera_distance": 5.0,
 	"camera_horizontal_angle": 0.0,
-	"camera_vertical_angle": PI/4
+	"camera_vertical_angle": PI/4,
+	"orbit_center_x": 0.0,  # Добавляем сохранение позиции центра орбиты
+	"orbit_center_y": 0.0,
+	"orbit_center_z": 0.0,
+	"camera_position_x": 0.0,  # Добавляем сохранение позиции камеры
+	"camera_position_y": 0.0,
+	"camera_position_z": 0.0
 }
 
 var config = ConfigFile.new()

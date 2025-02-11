@@ -58,6 +58,12 @@ var is_rotating := true
 var auto_rotation_speed := 0.5
 var initial_auto_rotation_speed := 0.5
 
+# Новые переменные для улучшенного управления
+var camera_move_speed := 5.0
+var camera_pan_speed := 2.0
+var middle_mouse_pressed := false
+var zoom_speed := 1.2  # Увеличенная скорость зума
+
 # ----- Базовые функции -----
 func _ready():
 	print("Начало инициализации просмотрщика моделей")
@@ -67,66 +73,192 @@ func _ready():
 	mouse_entered.connect(_on_viewport_mouse_entered)
 	mouse_exited.connect(_on_viewport_mouse_exited)
 	
-	# Устанавливаем начальные значения вращения
-	is_rotating = true
+	# Загружаем сохраненные настройки
+	load_saved_settings()
+	
+	# Регистрируем действия для WASD
+	if !InputMap.has_action("camera_forward"):
+		InputMap.add_action("camera_forward")
+		var event = InputEventKey.new()
+		event.keycode = KEY_W
+		InputMap.action_add_event("camera_forward", event)
+		
+	if !InputMap.has_action("camera_backward"):
+		InputMap.add_action("camera_backward")
+		var event = InputEventKey.new()
+		event.keycode = KEY_S
+		InputMap.action_add_event("camera_backward", event)
+		
+	if !InputMap.has_action("camera_left"):
+		InputMap.add_action("camera_left")
+		var event = InputEventKey.new()
+		event.keycode = KEY_A
+		InputMap.action_add_event("camera_left", event)
+		
+	if !InputMap.has_action("camera_right"):
+		InputMap.add_action("camera_right")
+		var event = InputEventKey.new()
+		event.keycode = KEY_D
+		InputMap.action_add_event("camera_right", event)
+	
+func _process(delta: float) -> void:
+	if !current_model:
+		return
+		
+	# Автоматическое вращение теперь работает независимо от положения мыши
+	if current_model and is_rotating and !dragging and !middle_mouse_pressed:
+		camera_horizontal_angle += delta * auto_rotation_speed
+		update_camera_position()
+	
+	# WASD перемещение активно только когда мышь над вьюпортом
+	if !mouse_in_viewport:
+		return
+		
+	# WASD перемещение
+	var move_vec := Vector3.ZERO
+	
+	if Input.is_action_pressed("camera_forward"):
+		move_vec.z -= 1
+	if Input.is_action_pressed("camera_backward"):
+		move_vec.z += 1
+	if Input.is_action_pressed("camera_left"):
+		move_vec.x -= 1
+	if Input.is_action_pressed("camera_right"):
+		move_vec.x += 1
+	
+	if move_vec != Vector3.ZERO:
+		# Нормализуем вектор движения
+		move_vec = move_vec.normalized()
+		
+		# Получаем базис камеры для движения относительно её ориентации
+		var cam_basis: Basis = preview_camera.global_transform.basis
+		
+		# Преобразуем вектор движения в пространство камеры
+		move_vec = cam_basis * move_vec
+		move_vec.y = 0  # Обнуляем вертикальное движение
+		move_vec = move_vec.normalized() * camera_move_speed * delta
+		
+		# Перемещаем центр орбиты и камеру
+		orbit_center += move_vec
+		preview_camera.global_position += move_vec
+		
+func save_camera_settings() -> void:
+	if owner and owner.settings:
+		print("Saving camera settings...")
+		# Сохраняем настройки камеры
+		owner.settings.set_setting("camera_distance", camera_distance)
+		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
+		owner.settings.set_setting("camera_vertical_angle", camera_vertical_angle)
+		
+		# Сохраняем позицию центра орбиты
+		owner.settings.set_setting("orbit_center_x", orbit_center.x)
+		owner.settings.set_setting("orbit_center_y", orbit_center.y)
+		owner.settings.set_setting("orbit_center_z", orbit_center.z)
+		
+		# Сохраняем настройки вращения
+		owner.settings.set_setting("auto_rotation", is_rotating)
+		owner.settings.set_setting("rotation_speed", auto_rotation_speed)
+
+func load_saved_settings() -> void:
+	if !owner or !owner.settings:
+		return
+		
+	print("Loading saved camera settings...")
+	
+	# Загружаем настройки камеры
+	camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
+	camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
+	camera_distance = owner.settings.get_setting("camera_distance")
+	
+	# Загружаем позицию центра орбиты
+	orbit_center = Vector3(
+		owner.settings.get_setting("orbit_center_x"),
+		owner.settings.get_setting("orbit_center_y"),
+		owner.settings.get_setting("orbit_center_z")
+	)
+	
+	# Загружаем настройки вращения
+	is_rotating = owner.settings.get_setting("auto_rotation")
 	auto_rotation_speed = owner.settings.get_setting("rotation_speed")
 	initial_auto_rotation_speed = auto_rotation_speed
 	
-func _process(delta: float) -> void:
-	if current_model and is_rotating and !dragging:
-		camera_horizontal_angle += delta * auto_rotation_speed
-		update_camera_position()
-		
-func _notification(what: int) -> void:
-	if what == NOTIFICATION_WM_CLOSE_REQUEST:
-		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
-		owner.settings.set_setting("camera_vertical_angle", camera_vertical_angle)
+	saved_settings_loaded = true
+	
+	print("Camera settings loaded:")
+	print("- Horizontal angle:", camera_horizontal_angle)
+	print("- Vertical angle:", camera_vertical_angle)
+	print("- Distance:", camera_distance)
+	print("- Orbit center:", orbit_center)
+	print("- Auto rotation:", is_rotating)
+	print("- Rotation speed:", auto_rotation_speed)
 
 # ----- Загрузка и управление моделью -----
-func load_in_preview_portal(model_path):
+func load_in_preview_portal(model_path: String) -> String:
 	print("Loading model from path:", model_path)
 	clear_model()
+	
 	var model = load_model_from_path(model_path)
-	if model:
-		current_model = model
-		preview_viewport.add_child(current_model)
-		print("Model loaded successfully")
-		
-		# Загружаем сохраненные настройки камеры
-		if !saved_settings_loaded:
-			print("Loading saved camera settings...")
-			camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
-			camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
-			camera_distance = owner.settings.get_setting("camera_distance")
-			auto_rotation_speed = owner.settings.get_setting("rotation_speed")
-			initial_auto_rotation_speed = auto_rotation_speed
-			saved_settings_loaded = true
-			is_rotating = true
-		else:
-			print("Using current camera angles")
-		
-		print("Camera settings:")
-		print("- Horizontal angle:", camera_horizontal_angle)
-		print("- Vertical angle:", camera_vertical_angle)
-		print("- Distance:", camera_distance)
-		print("- Auto rotation:", is_rotating)
-		print("- Rotation speed:", auto_rotation_speed)
-		
-		orbit_center = Vector3.ZERO
-		center_camera_on_model()
-		update_camera_position()
-		
-		if owner and owner.settings:
-			owner.settings.set_setting("auto_rotation", is_rotating)
-			owner.settings.set_setting("rotation_speed", auto_rotation_speed)
-		
-		return "Модель загружена успешно"
-	else:
+	if !model:
 		print("Failed to load model")
 		return "Ошибка загрузки модели"
+
+	current_model = model
+	preview_viewport.add_child(current_model)
+	
+	# Сбрасываем позицию модели в центр
+	current_model.position = Vector3.ZERO
+	
+	# Получаем размер модели для настройки камеры
+	var model_size := get_model_size()
+	print("Model size:", model_size)
+	
+	# Устанавливаем начальные значения камеры
+	if !saved_settings_loaded:
+		# Устанавливаем начальные значения для первой загрузки
+		camera_horizontal_angle = 0.0
+		camera_vertical_angle = PI/4
+		camera_distance = model_size * 1.5
+		orbit_center = Vector3.ZERO
+		is_rotating = true
+		auto_rotation_speed = 0.5
+		initial_auto_rotation_speed = auto_rotation_speed
+		saved_settings_loaded = true
+	else:
+		# Загружаем сохраненные значения
+		camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
+		camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
+		camera_distance = owner.settings.get_setting("camera_distance")
+		auto_rotation_speed = owner.settings.get_setting("rotation_speed")
+		initial_auto_rotation_speed = auto_rotation_speed
 		
-	if model is MeshInstance3D:
-		model.mesh = model.mesh.create_convex_shape()
+		# Восстанавливаем позицию центра орбиты
+		orbit_center = Vector3(
+			owner.settings.get_setting("orbit_center_x"),
+			owner.settings.get_setting("orbit_center_y"),
+			owner.settings.get_setting("orbit_center_z")
+		)
+		
+		# Проверяем и ограничиваем значения
+		var min_distance := model_size * 0.5
+		var max_distance := model_size * 20.0
+		camera_distance = clamp(camera_distance, min_distance, max_distance)
+	
+	# Обновляем позицию камеры
+	update_camera_position()
+	
+	print("Camera settings after load:")
+	print("- Distance:", camera_distance)
+	print("- Horizontal angle:", camera_horizontal_angle)
+	print("- Vertical angle:", camera_vertical_angle)
+	print("- Orbit center:", orbit_center)
+	print("- Model position:", current_model.position)
+	
+	if owner and owner.settings:
+		owner.settings.set_setting("auto_rotation", is_rotating)
+		owner.settings.set_setting("rotation_speed", auto_rotation_speed)
+		owner.settings.set_setting("camera_distance", camera_distance)
+	
+	return "Модель загружена успешно"
 
 func load_mtl_file(mtl_path: String) -> Dictionary:
 	var materials = {}
@@ -235,6 +367,7 @@ func load_obj_model(path: String) -> Node3D:
 		materials = load_mtl_file(mtl_path)
 		print("Loaded materials:", materials.keys())
 	
+	# Parse OBJ file
 	while !file.eof_reached():
 		var line = file.get_line().strip_edges()
 		if line.is_empty() or line.begins_with("#"):
@@ -272,14 +405,37 @@ func load_obj_model(path: String) -> Node3D:
 				var face = []
 				for i in range(1, parts.size()):
 					var indices = parts[i].split("/")
+					
+					# Проверяем валидность индексов
 					if indices.size() >= 1 and indices[0].length() > 0:
-						face.append({
-							"vertex": int(indices[0]) - 1,
-							"uv": int(indices[1]) - 1 if indices.size() >= 2 and indices[1].length() > 0 else -1,
-							"normal": int(indices[2]) - 1 if indices.size() >= 3 and indices[2].length() > 0 else -1
-						})
-				faces.append(face)
-				materials_by_face.append(current_material_name)
+						var vertex_idx = int(indices[0]) - 1
+						var uv_idx = -1
+						var normal_idx = -1
+						
+						# UV координаты
+						if indices.size() >= 2 and indices[1].length() > 0:
+							uv_idx = int(indices[1]) - 1
+						
+						# Нормали
+						if indices.size() >= 3 and indices[2].length() > 0:
+							normal_idx = int(indices[2]) - 1
+						
+						# Проверяем валидность индексов
+						if vertex_idx >= 0 and vertex_idx < vertices.size():
+							if uv_idx >= 0 and uv_idx >= uvs.size():
+								uv_idx = -1
+							if normal_idx >= 0 and normal_idx >= normals.size():
+								normal_idx = -1
+								
+							face.append({
+								"vertex": vertex_idx,
+								"uv": uv_idx,
+								"normal": normal_idx
+							})
+				
+				if face.size() >= 3:  # Только если есть хотя бы 3 вершины
+					faces.append(face)
+					materials_by_face.append(current_material_name)
 	
 	file.close()
 	
@@ -297,17 +453,18 @@ func load_obj_model(path: String) -> Node3D:
 	# Create mesh for each material
 	for material_name in faces_by_material:
 		var material_faces = faces_by_material[material_name]
-		var mesh = ArrayMesh.new()
-		var surface_arrays = []
-		surface_arrays.resize(Mesh.ARRAY_MAX)
 		
+		# Create arrays for the mesh
 		var final_vertices = PackedVector3Array()
 		var final_normals = PackedVector3Array()
 		var final_uvs = PackedVector2Array()
 		
-		# Process faces for this material
+		# Process faces
 		for face in material_faces:
-			# Calculate face normal if no vertex normals provided
+			if face.size() < 3:
+				continue
+				
+			# Calculate face normal if needed
 			var face_normal = Vector3.ZERO
 			if face[0].normal == -1:
 				var v1 = vertices[face[0].vertex]
@@ -315,7 +472,7 @@ func load_obj_model(path: String) -> Node3D:
 				var v3 = vertices[face[2].vertex]
 				face_normal = (v2 - v1).cross(v3 - v1).normalized()
 			
-			# Triangulate the face
+			# Triangulate face
 			for i in range(1, face.size() - 1):
 				# Add vertices
 				final_vertices.append(vertices[face[0].vertex])
@@ -338,20 +495,33 @@ func load_obj_model(path: String) -> Node3D:
 					final_uvs.append(uvs[face[i].uv])
 					final_uvs.append(uvs[face[i + 1].uv])
 		
+		# Create mesh only if we have vertices
 		if final_vertices.size() > 0:
-			# Create mesh arrays
+			var mesh = ArrayMesh.new()
+			var surface_arrays = []
+			surface_arrays.resize(Mesh.ARRAY_MAX)
+			
 			surface_arrays[Mesh.ARRAY_VERTEX] = final_vertices
 			surface_arrays[Mesh.ARRAY_NORMAL] = final_normals
-			if final_uvs.size() > 0:
+			if final_uvs.size() == final_vertices.size():  # Only if we have UVs for all vertices
 				surface_arrays[Mesh.ARRAY_TEX_UV] = final_uvs
 			
+			# Create surface with arrays
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surface_arrays)
+			
+			# Create and apply material
+			var material = StandardMaterial3D.new()
+			material.vertex_color_use_as_albedo = true
+			material.metallic_specular = 0.1
+			material.roughness = 0.7
+			material.metallic = 0.0
+			mesh.surface_set_material(0, material)
 			
 			var mesh_instance = MeshInstance3D.new()
 			mesh_instance.mesh = mesh
 			mesh_instance.name = "Mesh_" + material_name
 			
-			# Get material data and apply materials
+			# Apply materials
 			var mtl_data = materials.get(material_name)
 			_apply_materials(mesh_instance)
 			if mtl_data:
@@ -359,8 +529,6 @@ func load_obj_model(path: String) -> Node3D:
 			
 			root.add_child(mesh_instance)
 			mesh_instance.owner = root
-			
-			# Enable shadows
 			mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	
 	return root if root.get_child_count() > 0 else null
@@ -377,54 +545,146 @@ func setup_model_defaults(model: Node3D) -> void:
 				child.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	
 # ----- Функции загрузки моделей -----
+# Обновленная функция load_gltf_model
 func load_gltf_model(path: String) -> Node3D:
+	print("Loading GLTF file:", path)
 	var doc = GLTFDocument.new()
 	var state = GLTFState.new()
+	var err = ERR_FILE_NOT_FOUND
 	
 	state.handle_binary_image = true
 	state.use_named_skin_binds = true
 	
-	var file = FileAccess.open(path, FileAccess.READ)
-	if !file:
-		print("Failed to open GLTF file: ", path)
-		return null
-		
-	var bytes = file.get_buffer(file.get_length())
-	file.close()
+	var base_path = path.get_base_dir()
+	print("Base path:", base_path)
+	print("Checking textures in directory:", base_path)
 	
-	var err = doc.append_from_buffer(bytes, path.get_base_dir(), state)
+	# Проверяем наличие файла текстуры
+	var texture_path = base_path.path_join("spacebits_texture.png")
+	if FileAccess.file_exists(texture_path):
+		print("Found texture at:", texture_path)
+	else:
+		print("Texture not found at:", texture_path)
+		# Ищем текстуру в соседних директориях
+		var parent_dir = base_path.get_base_dir()
+		texture_path = parent_dir.path_join("spacebits_texture.png")
+		if FileAccess.file_exists(texture_path):
+			print("Found texture in parent dir:", texture_path)
+	
+	# Загружаем GLTF/GLB
+	if path.get_extension().to_lower() == "glb":
+		var file = FileAccess.open(path, FileAccess.READ)
+		if !file:
+			push_error("Failed to open GLB file: " + path)
+			return null
+		var bytes = file.get_buffer(file.get_length())
+		file.close()
+		err = doc.append_from_buffer(bytes, base_path, state)
+	else:
+		err = doc.append_from_file(path, state)
+	
 	if err != OK:
-		print("Error parsing GLTF data: ", err)
+		push_error("Error parsing GLTF/GLB file: " + str(err))
 		return null
 	
 	var scene = doc.generate_scene(state)
-	if scene:
-		var root = Node3D.new()
-		root.add_child(scene)
-		scene.owner = root
-		
-		for node in _get_all_children(root):
-			if node is MeshInstance3D:
-				_apply_materials(node)
-		
-		root.transform = Transform3D.IDENTITY
-		scene.transform = Transform3D.IDENTITY
-		
-		print("Model successfully loaded via GLTFDocument")
-		return root
+	if !scene:
+		push_error("Failed to generate scene")
+		return null
 	
-	print("Failed to generate scene")
-	return null
+	var root = Node3D.new()
+	root.add_child(scene)
+	scene.owner = root
+	
+	# Сохраняем существующие материалы
+	for node in _get_all_children(root):
+		if node is MeshInstance3D:
+			for surface_idx in range(node.mesh.get_surface_count()):
+				var material = node.mesh.surface_get_material(surface_idx)
+				if material:
+					material.resource_local_to_scene = true
+					if material is StandardMaterial3D:
+						material.cull_mode = BaseMaterial3D.CULL_DISABLED
+						# Проверяем текстуру
+						if material.albedo_texture == null and material.get_name() == "spacebits_texture":
+							print("Attempting to load texture for material:", material.get_name())
+							if FileAccess.file_exists(texture_path):
+								var image = Image.new()
+								var err2 = image.load(texture_path)
+								if err2 == OK:
+									var texture = ImageTexture.create_from_image(image)
+									material.albedo_texture = texture
+									print("Successfully loaded texture")
+			node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	
+	root.transform = Transform3D.IDENTITY
+	scene.transform = Transform3D.IDENTITY
+	
+	return root
 
-# Заменим функцию load_model_from_path:
+func _setup_gltf_materials(mesh_instance: MeshInstance3D) -> void:
+	if !mesh_instance.mesh:
+		return
+		
+	for surface_idx in range(mesh_instance.mesh.get_surface_count()):
+		var current_material = mesh_instance.mesh.surface_get_material(surface_idx)
+		if current_material and current_material is StandardMaterial3D:
+			# Don't modify existing valid materials
+			# Just ensure double-sided rendering
+			current_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+		else:
+			# Only create new material if none exists
+			var new_material = StandardMaterial3D.new()
+			new_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+			new_material.vertex_color_use_as_albedo = true
+			new_material.albedo_color = Color(0.8, 0.8, 0.8, 1.0)
+			new_material.metallic = 0.0
+			new_material.roughness = 0.7
+			mesh_instance.mesh.surface_set_material(surface_idx, new_material)
+
 func load_model_from_path(path: String) -> Node3D:
+	var model: Node3D = null
 	var extension = path.get_extension().to_lower()
+	
 	if extension == "obj":
-		return load_obj_model(path)
+		model = load_obj_model(path)
 	elif extension in ["gltf", "glb"]:
-		return load_gltf_model(path)
-	print("Unsupported file format: ", extension)
-	return null
+		model = load_gltf_model(path)
+	
+	if model:
+		# Сбрасываем все трансформации
+		model.transform = Transform3D.IDENTITY
+		
+		# Находим все меши в модели
+		var meshes := []
+		for child in _get_all_children(model):
+			if child is MeshInstance3D:
+				meshes.append(child)
+		
+		if meshes.is_empty():
+			return model
+			
+		# Вычисляем общий AABB для всех мешей
+		var aabb := AABB()
+		var first = true
+		
+		for mesh_instance in meshes:
+			var mesh_aabb := (mesh_instance as MeshInstance3D).get_aabb()
+			if first:
+				aabb = mesh_aabb
+				first = false
+			else:
+				aabb = aabb.merge(mesh_aabb)
+		
+		# Центрируем модель по центру AABB
+		var offset := -aabb.get_center()
+		model.position = offset
+		
+		print("Model loaded and centered:")
+		print("- Original AABB:", aabb)
+		print("- Applied offset:", offset)
+	
+	return model
 
 # Удалите обе существующие версии функции _apply_obj_materials и замените их этой:
 func _apply_materials(mesh_instance: MeshInstance3D) -> void:
@@ -432,48 +692,48 @@ func _apply_materials(mesh_instance: MeshInstance3D) -> void:
 		return
 		
 	for surface_idx in range(mesh_instance.mesh.get_surface_count()):
-		var material = mesh_instance.mesh.surface_get_material(surface_idx)
-		if material and material is StandardMaterial3D:
+		var surface_mat = mesh_instance.mesh.surface_get_material(surface_idx)
+		if surface_mat and surface_mat is StandardMaterial3D:
 			# Enable double-sided rendering
-			material.cull_mode = BaseMaterial3D.CULL_DISABLED
-			material.no_depth_test = false
+			surface_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+			surface_mat.no_depth_test = false
 			
 			# Enable vertex coloring if available
-			material.vertex_color_use_as_albedo = true
+			surface_mat.vertex_color_use_as_albedo = true
 			
 			# Basic material settings
-			material.metallic_specular = 0.1
-			material.roughness = 0.7
-			material.metallic = 0.0
+			surface_mat.metallic_specular = 0.1
+			surface_mat.roughness = 0.7
+			surface_mat.metallic = 0.0
 			
 			# Disable transparency
-			material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+			surface_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
 			
 			# Set shading modes
-			material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-			material.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
-			material.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
+			surface_mat.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+			surface_mat.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
+			surface_mat.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
 		else:
 			# Create new material if none exists
-			var new_material = StandardMaterial3D.new()
+			var new_mat = StandardMaterial3D.new()
 			
 			# Set all basic properties
-			new_material.cull_mode = BaseMaterial3D.CULL_DISABLED
-			new_material.no_depth_test = false
-			new_material.vertex_color_use_as_albedo = true
-			new_material.metallic_specular = 0.1
-			new_material.roughness = 0.7
-			new_material.metallic = 0.0
-			new_material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
-			new_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-			new_material.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
-			new_material.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
+			new_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+			new_mat.no_depth_test = false
+			new_mat.vertex_color_use_as_albedo = true
+			new_mat.metallic_specular = 0.1
+			new_mat.roughness = 0.7
+			new_mat.metallic = 0.0
+			new_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+			new_mat.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+			new_mat.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
+			new_mat.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
 			
 			# Apply default color
-			new_material.albedo_color = Color(0.8, 0.8, 0.8, 1.0)
+			new_mat.albedo_color = Color(0.8, 0.8, 0.8, 1.0)
 			
 			# Apply new material
-			mesh_instance.mesh.surface_set_material(surface_idx, new_material)
+			mesh_instance.mesh.surface_set_material(surface_idx, new_mat)
 
 func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMaterial, model_path: String) -> void:
 	if !mesh_instance.mesh:
@@ -494,25 +754,50 @@ func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMate
 	material.emission = mtl_data.emission
 	material.emission_energy = mtl_data.emission_energy
 	
-	# Load textures
+	# Load textures with improved path handling
 	for texture_type in mtl_data.texture_paths:
 		var texture_path = mtl_data.texture_paths[texture_type]
 		if !texture_path.is_empty():
-			var full_path = model_path.get_base_dir().path_join(texture_path)
-			if FileAccess.file_exists(full_path):
-				print("Loading texture: ", full_path)
+			# Нормализуем пути для разных ОС
+			var normalized_texture_path = texture_path.replace("\\", "/")
+			var base_dir = model_path.get_base_dir()
+			var full_path = base_dir.path_join(normalized_texture_path)
+			
+			# Пробуем различные варианты путей
+			var possible_paths = [
+				full_path,
+				base_dir.path_join(normalized_texture_path.get_file()),
+				normalized_texture_path,
+				base_dir.path_join(normalized_texture_path.to_lower()),  # Пробуем нижний регистр
+				base_dir.path_join(normalized_texture_path.to_upper())   # Пробуем верхний регистр
+			]
+			
+			var valid_path = ""
+			for path in possible_paths:
+				if FileAccess.file_exists(path):
+					valid_path = path
+					break
+					
+			if valid_path != "":
+				print("Loading texture from path: ", valid_path)
 				var image = Image.new()
-				if image.load(full_path) == OK:
+				var err = image.load(valid_path)
+				if err == OK:
 					var texture = ImageTexture.create_from_image(image)
 					match texture_type:
 						"albedo":
 							material.albedo_texture = texture
 						"normal":
 							material.normal_texture = texture
+							material.normal_enabled = true
 						"metallic":
 							material.metallic_texture = texture
 						"roughness":
 							material.roughness_texture = texture
+				else:
+					push_error("Failed to load texture: %s, error: %s" % [valid_path, err])
+			else:
+				push_warning("Could not find texture: %s" % texture_path)
 	
 	# Set shading modes
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
@@ -522,6 +807,24 @@ func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMate
 	# Apply to all surfaces
 	for i in range(mesh_instance.mesh.get_surface_count()):
 		mesh_instance.mesh.surface_set_material(i, material)
+
+func _setup_material_properties(material: StandardMaterial3D) -> void:
+	material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+	material.vertex_color_use_as_albedo = true
+	material.metallic_specular = 0.1
+	material.roughness = 0.7
+	
+	# Настройка прозрачности
+	if material.albedo_color.a < 1.0:
+		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	else:
+		material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+	
+	# Улучшение качества текстур
+	if material.albedo_texture:
+		material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+		material.texture_repeat = true
 
 func fix_materials(model: Node3D):
 	for child in model.get_children():
@@ -534,8 +837,34 @@ func fix_materials(model: Node3D):
 			
 func clear_model():
 	if current_model:
+		# Очищаем все материалы и текстуры
+		for child in _get_all_children(current_model):
+			if child is MeshInstance3D:
+				var mesh = child.mesh
+				if mesh:
+					for i in range(mesh.get_surface_count()):
+						var surface_mat = mesh.surface_get_material(i)
+						if surface_mat and surface_mat is StandardMaterial3D:
+							# Очищаем текстуры
+							surface_mat.albedo_texture = null
+							surface_mat.normal_texture = null
+							surface_mat.metallic_texture = null
+							surface_mat.roughness_texture = null
+							# Отсоединяем материал
+							mesh.surface_set_material(i, null)
+				
+				# Отсоединяем меш
+				child.mesh = null
+		
+		# Освобождаем модель
 		current_model.queue_free()
 		current_model = null
+		
+		# Запускаем отложенную очистку ресурсов
+		if Engine.get_frames_drawn() % 1000 == 0:
+			# Используем call_deferred для безопасного вызова сборки мусора
+			await get_tree().physics_frame
+			get_tree().call_deferred("garbage_collect")
 
 func _on_viewport_mouse_entered() -> void:
 	mouse_in_viewport = true
@@ -605,55 +934,50 @@ func _input(event: InputEvent) -> void:
 
 # Обновляем функцию _unhandled_input
 func _unhandled_input(event: InputEvent) -> void:
-	if !current_model or !mouse_in_viewport:  # Проверяем наличие модели и положение мыши
+	if !current_model or !mouse_in_viewport:
 		return
 	
 	if event is InputEventMouseButton:
-		print("Mouse button event detected: ", event.button_index)
 		match event.button_index:
-			MOUSE_BUTTON_LEFT:
-				dragging = event.pressed
-				print("Left mouse button: ", "pressed" if dragging else "released")
-				if dragging:
-					print("Setting mouse mode to confined")
-					Input.mouse_mode = Input.MOUSE_MODE_CONFINED
-					is_rotating = false
+			MOUSE_BUTTON_MIDDLE:  # Колёсико мыши
+				middle_mouse_pressed = event.pressed
+				if middle_mouse_pressed:
+					last_mouse_position = event.position
+					Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 				else:
-					print("Setting mouse mode to visible")
 					Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 					
 			MOUSE_BUTTON_WHEEL_UP:
-				if mouse_in_viewport:  # Дополнительная проверка для колеса мыши
-					print("Mouse wheel up")
-					var model_size = get_model_size()
-					var min_distance = model_size * 0.5
-					camera_distance = max(min_distance, camera_distance * 0.9)
+				if mouse_in_viewport:
+					var model_size := get_model_size()
+					camera_distance = max(model_size * 0.1, camera_distance / zoom_speed)
 					update_camera_position()
-					get_viewport().set_input_as_handled()  # Помечаем событие как обработанное
-			
+					get_viewport().set_input_as_handled()
+					
 			MOUSE_BUTTON_WHEEL_DOWN:
-				if mouse_in_viewport:  # Дополнительная проверка для колеса мыши
-					print("Mouse wheel down")
-					var model_size = get_model_size()
-					var max_distance = model_size * 10.0
-					camera_distance = min(max_distance, camera_distance * 1.1)
+				if mouse_in_viewport:
+					var model_size := get_model_size()
+					camera_distance = min(model_size * 20.0, camera_distance * zoom_speed)
 					update_camera_position()
-					get_viewport().set_input_as_handled()  # Помечаем событие как обработанное
-	
+					get_viewport().set_input_as_handled()
+					
 	elif event is InputEventMouseMotion:
-		if dragging:
-			print("Mouse motion while dragging: ", event.relative)
+		if middle_mouse_pressed:
+			# Панорамирование камеры при зажатом колесике
+			var delta: Vector2 = event.relative
+			var cam_basis: Basis = preview_camera.global_transform.basis
+			orbit_center -= cam_basis.x * delta.x * camera_pan_speed * 0.01
+			orbit_center += cam_basis.y * delta.y * camera_pan_speed * 0.01
+			update_camera_position()
+			
+		elif dragging:
 			camera_sensitivity = 0.003
-			
 			camera_horizontal_angle -= event.relative.x * camera_sensitivity
-			
 			camera_vertical_angle = clamp(
 				camera_vertical_angle - event.relative.y * camera_sensitivity,
 				0.1,
 				PI - 0.1
 			)
-			
-			print("Camera angles - Horizontal: ", camera_horizontal_angle, " Vertical: ", camera_vertical_angle)
 			update_camera_position()
 
 # Получаем минимальное расстояние камеры на основе размера модели
@@ -676,14 +1000,16 @@ func _get_all_children(node: Node) -> Array:
 # Получаем размер модели
 func get_model_size() -> float:
 	if !current_model:
-		return 5.0  # Значение по умолчанию
+		return 2.0
 	
-	var aabb = AABB()
-	var has_mesh = false
+	var aabb := AABB()
+	var has_mesh := false
 	
 	for child in _get_all_children(current_model):
 		if child is MeshInstance3D:
-			var mesh_aabb = (child as MeshInstance3D).get_aabb()
+			var mesh_instance := child as MeshInstance3D
+			var mesh_aabb := mesh_instance.get_aabb()
+			
 			if !has_mesh:
 				aabb = mesh_aabb
 				has_mesh = true
@@ -691,8 +1017,14 @@ func get_model_size() -> float:
 				aabb = aabb.merge(mesh_aabb)
 	
 	if has_mesh:
-		return max(aabb.size.x, max(aabb.size.y, aabb.size.z))
-	return 5.0  # Значение по умолчанию
+		var size: float = max(aabb.size.x, max(aabb.size.y, aabb.size.z))
+		if size < 0.1:
+			return 2.0
+		elif size > 1000.0:
+			return 10.0
+		return size
+	
+	return 2.0
 
 func toggle_rotation() -> void:
 	print("Toggle rotation called")
@@ -724,16 +1056,26 @@ func update_camera_position() -> void:
 	if !preview_camera or !current_model:
 		return
 	
+	# Убеждаемся, что расстояние камеры не слишком большое
+	var model_size := get_model_size()
+	var max_allowed_distance := model_size * 20.0  # Увеличено максимальное расстояние
+	camera_distance = min(camera_distance, max_allowed_distance)
+	
+	# Вычисляем позицию камеры в сферических координатах
 	var x = sin(camera_horizontal_angle) * sin(camera_vertical_angle) * camera_distance
 	var y = cos(camera_vertical_angle) * camera_distance
 	var z = cos(camera_horizontal_angle) * sin(camera_vertical_angle) * camera_distance
 	
+	# Устанавливаем позицию камеры относительно центра вращения
 	var new_position = orbit_center + Vector3(x, y, z)
-	print("Camera moved to: ", new_position)
-	
 	preview_camera.global_position = new_position
 	preview_camera.look_at(orbit_center)
 	
+	# Настраиваем параметры камеры для лучшего отображения
+	preview_camera.near = model_size * 0.01
+	preview_camera.far = model_size * 100.0
+	
+	# Сохраняем настройки
 	if owner and owner.settings:
 		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
 		owner.settings.set_setting("camera_vertical_angle", camera_vertical_angle)
@@ -743,42 +1085,67 @@ func center_camera_on_model() -> void:
 	if !current_model:
 		return
 	
-	var aabb = AABB()
-	var has_mesh = false
+	# Calculate the combined AABB of all meshes
+	var combined_aabb := AABB()
+	var first_mesh := true
+	var mesh_count := 0
 	
 	for child in _get_all_children(current_model):
 		if child is MeshInstance3D:
-			var mesh_aabb = (child as MeshInstance3D).get_aabb()
-			var global_pos = child.global_position
-			mesh_aabb.position += global_pos
+			var mesh_instance := child as MeshInstance3D
+			var mesh_aabb := mesh_instance.get_aabb()
+			var global_transform := mesh_instance.global_transform
 			
-			if !has_mesh:
-				aabb = mesh_aabb
-				has_mesh = true
+			# Transform AABB to global space
+			var transformed_aabb := AABB(
+				global_transform * mesh_aabb.position,
+				mesh_aabb.size
+			)
+			
+			if first_mesh:
+				combined_aabb = transformed_aabb
+				first_mesh = false
 			else:
-				aabb = aabb.merge(mesh_aabb)
+				combined_aabb = combined_aabb.merge(transformed_aabb)
+			
+			mesh_count += 1
 	
-	if has_mesh:
-		var model_size = max(aabb.size.x, max(aabb.size.y, aabb.size.z))
-		orbit_center = aabb.get_center()
+	if mesh_count == 0:
+		print("Warning: No meshes found in model")
+		return
 		
-		# Устанавливаем начальные значения только если это первая загрузка
-		if !saved_settings_loaded:
-			camera_horizontal_angle = 0.0
-			camera_vertical_angle = PI/4  # 45 градусов
-			camera_distance = model_size * 2.0  # Расстояние зависит от размера модели
-		
-		# Центрируем модель
-		current_model.global_position = -orbit_center
-		orbit_center = Vector3.ZERO
-		
-		update_camera_position()
-		
-		print("Model centered. Size:", model_size)
-		print("Camera settings after centering:")
-		print("- Horizontal angle:", camera_horizontal_angle)
-		print("- Vertical angle:", camera_vertical_angle)
-		print("- Distance:", camera_distance)
+	# Calculate model size and center
+	var model_size := combined_aabb.size.length()
+	var model_center := combined_aabb.get_center()
+	
+	print("Model metrics:")
+	print("- Size: ", model_size)
+	print("- Center: ", model_center)
+	print("- AABB: ", combined_aabb)
+	
+	# Reset model position to center at origin
+	current_model.global_position = -model_center
+	orbit_center = Vector3.ZERO
+	
+	# Adjust camera distance based on model size
+	if !saved_settings_loaded:
+		camera_distance = model_size * 2.0
+		camera_horizontal_angle = 0.0
+		camera_vertical_angle = PI/4
+	
+	# Ensure minimum and maximum distances
+	camera_distance = clamp(
+		camera_distance,
+		model_size * 0.5,  # Minimum distance
+		model_size * 10.0  # Maximum distance
+	)
+	
+	update_camera_position()
+	
+	print("Camera settings after centering:")
+	print("- Distance: ", camera_distance)
+	print("- Horizontal angle: ", camera_horizontal_angle)
+	print("- Vertical angle: ", camera_vertical_angle)
 
 func setup_preview_camera() -> void:
 	if !preview_camera:
@@ -803,52 +1170,49 @@ func setup_environment() -> void:
 		if child is Light3D or child is WorldEnvironment:
 			child.queue_free()
 	
-	# Настройка окружения для более яркого освещения
 	var environment = Environment.new()
 	environment.background_mode = Environment.BG_COLOR
-	environment.background_color = Color(0.2, 0.2, 0.2)  # Более светлый фон
+	environment.background_color = Color(0.2, 0.2, 0.2)
 	environment.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	environment.ambient_light_color = Color(0.4, 0.4, 0.4)  # Увеличена яркость фонового освещения
-	environment.ambient_light_energy = 1.5  # Увеличена энергия фонового света
+	environment.ambient_light_color = Color(0.4, 0.4, 0.4)
+	environment.ambient_light_energy = 1.5
 	
-	# Отключаем ненужные эффекты
-	environment.fog_enabled = false
-	environment.volumetric_fog_enabled = false
-	environment.glow_enabled = false
-	environment.ssr_enabled = false
-	environment.sdfgi_enabled = false
-	environment.ssao_enabled = false
+	# Настройка рендеринга
+	environment.ssr_enabled = true
+	environment.ssao_enabled = true
+	environment.glow_enabled = true
+	environment.glow_intensity = 0.5
+	environment.glow_strength = 1.0
+	environment.glow_bloom = 0.0
+	environment.glow_hdr_threshold = 1.0
+	
+	# Настройка тонального отображения
+	environment.tonemap_mode = Environment.TONE_MAPPER_ACES
+	environment.tonemap_exposure = 1.0
+	environment.tonemap_white = 1.0
 	
 	var world_environment = WorldEnvironment.new()
 	world_environment.environment = environment
 	preview_viewport.add_child(world_environment)
 	
-	# Основной свет (направленный вниз и вперед)
+	# Основное освещение
 	var main_light = DirectionalLight3D.new()
 	main_light.rotation_degrees = Vector3(-60, -30, 0)
-	main_light.light_energy = 2.0  # Увеличена яркость основного света
-	main_light.light_color = Color(1.0, 0.98, 0.95)  # Слегка теплый оттенок
+	main_light.light_energy = 2.0
+	main_light.light_color = Color(1.0, 0.98, 0.95)
 	main_light.shadow_enabled = true
 	main_light.shadow_bias = 0.01
 	main_light.shadow_normal_bias = 1.0
 	main_light.shadow_blur = 1.0
 	preview_viewport.add_child(main_light)
 	
-	# Заполняющий свет (с противоположной стороны)
+	# Дополнительное освещение
 	var fill_light = DirectionalLight3D.new()
 	fill_light.rotation_degrees = Vector3(-30, 150, 0)
-	fill_light.light_energy = 1.0  # Увеличена яркость заполняющего света
-	fill_light.light_color = Color(0.95, 0.95, 1.0)  # Слегка холодный оттенок
+	fill_light.light_energy = 1.0
+	fill_light.light_color = Color(0.95, 0.95, 1.0)
 	fill_light.shadow_enabled = false
 	preview_viewport.add_child(fill_light)
-	
-	# Подсветка снизу для лучшей видимости деталей
-	var rim_light = DirectionalLight3D.new()
-	rim_light.rotation_degrees = Vector3(45, -120, 0)
-	rim_light.light_energy = 0.5
-	rim_light.light_color = Color(1.0, 1.0, 1.0)
-	rim_light.shadow_enabled = false
-	preview_viewport.add_child(rim_light)
 
 func setup_viewport() -> void:
 	if !preview_viewport:

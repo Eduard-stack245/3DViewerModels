@@ -77,17 +77,16 @@ func _init_ui() -> void:
 	
 	viewport_container.preview_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
 	viewport_container.preview_viewport.transparent_bg = false
-
+	
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
 		print("=== Saving settings before exit ===")
 		if viewport_container:
-			print("Saving viewport settings...")
-			settings.set_setting("auto_rotation", viewport_container.is_rotating)
-			settings.set_setting("rotation_speed", viewport_container.auto_rotation_speed)
-			settings.set_setting("camera_distance", viewport_container.camera_distance)
-			settings.set_setting("camera_horizontal_angle", viewport_container.camera_horizontal_angle)
-			settings.set_setting("camera_vertical_angle", viewport_container.camera_vertical_angle)
+			# Сохраняем настройки камеры и просмотрщика
+			viewport_container.save_camera_settings()
+			
+			# Сохраняем путь к текущей директории
+			settings.set_setting("last_directory", file_dialog.current_dir)
 			
 			# Сохраняем последнюю открытую модель
 			if viewport_container.current_model and !model_paths.is_empty() and model_list.get_selected_items().size() > 0:
@@ -95,6 +94,9 @@ func _notification(what: int) -> void:
 				print("Saving last model path:", current_model_path)
 				settings.set_setting("last_model", current_model_path)
 			
+			# Принудительно сохраняем настройки
+			settings.save_settings()
+		
 		print("=== Settings saved ===")
 		get_tree().quit()
 
