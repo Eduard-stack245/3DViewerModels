@@ -9,8 +9,14 @@ class_name PreviewModel
 const SUPPORTED_FORMATS = {
 	"glb": "gltf",
 	"gltf": "gltf",
-	"obj": "obj"
+	"obj": "obj",
+	"fbx": "fbx"
 }
+
+const GLTF_CACHE_DIR := "user://gltf_cache"
+const GLTF_TEXTURE_EXTENSIONS := ["png", "jpg", "jpeg", "webp", "bmp", "tga", "hdr", "exr"]
+const FALLBACK_PNG_BASE64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+const FALLBACK_TEXTURE_FILE_NAME := "__missing_gltf_texture.png"
 
 class MTLMaterial:
 	var name: String
@@ -43,6 +49,7 @@ var orbit_center := Vector3.ZERO
 
 var current_model: Node3D = null
 var saved_settings_loaded := false
+var _resize_queued: bool = false
 
 var mouse_in_viewport := false
 var is_dragging := false
@@ -64,6 +71,7 @@ var is_playing: bool = false
 
 func _ready():
 	await get_tree().process_frame
+	_setup_responsive_viewport()
 	setup_environment()
 
 	mouse_entered.connect(_on_viewport_mouse_entered)
@@ -104,6 +112,49 @@ func _ready():
 		play_pause_button.visible = false
 	if timeline_slider:
 		timeline_slider.visible = false
+
+func _setup_responsive_viewport() -> void:
+	size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	size_flags_vertical = Control.SIZE_EXPAND_FILL
+	custom_minimum_size = Vector2(120, 100)
+	clip_contents = true
+	stretch = true
+
+	if !resized.is_connected(_queue_viewport_resize):
+		resized.connect(_queue_viewport_resize)
+
+	_queue_viewport_resize()
+
+
+func sync_viewport_size() -> void:
+	_queue_viewport_resize()
+
+
+func _queue_viewport_resize() -> void:
+	if _resize_queued:
+		return
+	_resize_queued = true
+	call_deferred("_sync_viewport_size")
+
+
+func _sync_viewport_size() -> void:
+	_resize_queued = false
+	if !preview_viewport:
+		return
+
+	# If SubViewportContainer.stretch is true, Godot automatically makes the
+	# SubViewport fill this container. Manual preview_viewport.size changes are
+	# forbidden in that mode and produce debugger warnings.
+	if !stretch:
+		var viewport_width: int = int(maxf(32.0, floor(size.x)))
+		var viewport_height: int = int(maxf(32.0, floor(size.y)))
+		var next_size := Vector2i(viewport_width, viewport_height)
+		if preview_viewport.size != next_size:
+			preview_viewport.size = next_size
+
+	if current_model:
+		update_camera_position()
+
 
 func _on_play_pause_pressed():
 	if !current_animation_player or !current_animation:
@@ -211,6 +262,52 @@ func load_saved_settings() -> void:
 	saved_settings_loaded = true
 	update_camera_position()
 
+func _get_transformed_aabb(mesh_instance: MeshInstance3D) -> AABB:
+	var local_aabb := mesh_instance.get_aabb()
+	var transform := mesh_instance.global_transform
+	var corners := [
+		local_aabb.position,
+		local_aabb.position + Vector3(local_aabb.size.x, 0, 0),
+		local_aabb.position + Vector3(0, local_aabb.size.y, 0),
+		local_aabb.position + Vector3(0, 0, local_aabb.size.z),
+		local_aabb.position + Vector3(local_aabb.size.x, local_aabb.size.y, 0),
+		local_aabb.position + Vector3(local_aabb.size.x, 0, local_aabb.size.z),
+		local_aabb.position + Vector3(0, local_aabb.size.y, local_aabb.size.z),
+		local_aabb.position + local_aabb.size
+	]
+
+	var result := AABB(transform * corners[0], Vector3.ZERO)
+	for i in range(1, corners.size()):
+		result = result.expand(transform * corners[i])
+	return result
+
+
+func _get_model_aabb(model: Node3D) -> Dictionary:
+	var combined_aabb := AABB()
+	var has_mesh := false
+
+	for child in _get_all_children(model):
+		if child is MeshInstance3D:
+			var mesh_instance := child as MeshInstance3D
+			if !mesh_instance.mesh:
+				continue
+			var mesh_aabb := _get_transformed_aabb(mesh_instance)
+			if !has_mesh:
+				combined_aabb = mesh_aabb
+				has_mesh = true
+			else:
+				combined_aabb = combined_aabb.merge(mesh_aabb)
+
+	return {
+		"has_mesh": has_mesh,
+		"aabb": combined_aabb
+	}
+
+
+func _get_aabb_max_axis(aabb: AABB) -> float:
+	return max(aabb.size.x, max(aabb.size.y, aabb.size.z))
+
+
 func load_in_preview_portal(model_path: String) -> String:
 	clear_model()
 	
@@ -223,48 +320,27 @@ func load_in_preview_portal(model_path: String) -> String:
 	preview_viewport.add_child(current_model)
 	
 	current_model.transform = Transform3D.IDENTITY
-	for child in _get_all_children(current_model):
-		if child is Node3D:
-			child.transform = Transform3D.IDENTITY
 
-	var total_aabb := AABB()
-	var has_mesh := false
-	var extreme_scale := false
-	
-	for child in _get_all_children(current_model):
-		if child is MeshInstance3D:
-			var mesh_instance := child as MeshInstance3D
-			var mesh_aabb := mesh_instance.get_aabb()
-			
-			var size := mesh_aabb.size
-			if size.length() > 1000.0 or size.length() < 0.001:
-				extreme_scale = true
-			
-			if !has_mesh:
-				total_aabb = mesh_aabb
-				has_mesh = true
-			else:
-				total_aabb = total_aabb.merge(mesh_aabb)
-	
-	if has_mesh:
-		var size: float
-		var center: Vector3
-		
-		if extreme_scale:
-			size = 5.0
-			center = Vector3.ZERO
-			current_model.scale = Vector3.ONE * (size / total_aabb.size.length())
-		else:
-			size = max(total_aabb.size.x, max(total_aabb.size.y, total_aabb.size.z))
-			center = total_aabb.get_center()
-			
-		current_model.position = -center
+	var aabb_info := _get_model_aabb(current_model)
+	if bool(aabb_info["has_mesh"]):
+		var total_aabb: AABB = aabb_info["aabb"]
+		var model_extent := _get_aabb_max_axis(total_aabb)
+
+		if model_extent > 1000.0 or model_extent < 0.001:
+			var target_extent := 5.0
+			current_model.scale = Vector3.ONE * (target_extent / max(model_extent, 0.0001))
+			aabb_info = _get_model_aabb(current_model)
+			total_aabb = aabb_info["aabb"]
+			model_extent = _get_aabb_max_axis(total_aabb)
+
+		var center := total_aabb.get_center()
+		current_model.global_position -= center
 		orbit_center = Vector3.ZERO
-		
+
 		if !saved_settings_loaded:
 			camera_horizontal_angle = 0.0
-			camera_vertical_angle = PI/4
-			camera_distance = size * 2.0
+			camera_vertical_angle = PI / 4
+			camera_distance = max(model_extent * 2.0, 2.0)
 			is_rotating = true
 			auto_rotation_speed = 0.5
 			initial_auto_rotation_speed = auto_rotation_speed
@@ -273,13 +349,13 @@ func load_in_preview_portal(model_path: String) -> String:
 			camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
 			camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
 			camera_distance = owner.settings.get_setting("camera_distance")
-			auto_rotation_speed = owner.settings.get_setting("rotation_speed")
-			initial_auto_rotation_speed = auto_rotation_speed
-			
-			var min_distance: float = size * 0.5
-			var max_distance: float = size * 10.0
-			camera_distance = clamp(camera_distance, min_distance, max_distance)
-		
+			is_rotating = owner.settings.get_setting("auto_rotation")
+			initial_auto_rotation_speed = owner.settings.get_setting("rotation_speed")
+			auto_rotation_speed = initial_auto_rotation_speed if is_rotating else 0.0
+
+		var min_distance: float = maxf(model_extent * 0.5, 0.1)
+		var max_distance: float = maxf(model_extent * 10.0, min_distance + 1.0)
+		camera_distance = clamp(camera_distance, min_distance, max_distance)
 		update_camera_position()
 	
 	if owner and owner.settings:
@@ -333,12 +409,12 @@ func load_mtl_file(mtl_path: String) -> Dictionary:
 			"Ks":
 				if current_material and parts.size() >= 4:
 					var specular = (float(parts[1]) + float(parts[2]) + float(parts[3])) / 3.0
-					current_material.metallic = clamp(specular, 0.0, 1.0)
+					current_material.metallic = clampf(specular, 0.0, 1.0)
 					
 			"Ns":
 				if current_material and parts.size() >= 2:
 					var shininess = float(parts[1])
-					current_material.roughness = clamp(1.0 - (shininess / 1000.0), 0.0, 1.0)
+					current_material.roughness = clampf(1.0 - (shininess / 1000.0), 0.0, 1.0)
 					
 			"d", "Tr":
 				if current_material and parts.size() >= 2:
@@ -518,12 +594,12 @@ func load_obj_model(path: String) -> Node3D:
 			
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, surface_arrays)
 			
-			var material = StandardMaterial3D.new()
-			material.vertex_color_use_as_albedo = true
-			material.metallic_specular = 0.1
-			material.roughness = 0.7
-			material.metallic = 0.0
-			mesh.surface_set_material(0, material)
+			var generated_material := StandardMaterial3D.new()
+			generated_material.vertex_color_use_as_albedo = true
+			generated_material.metallic_specular = 0.1
+			generated_material.roughness = 0.7
+			generated_material.metallic = 0.0
+			mesh.surface_set_material(0, generated_material)
 			
 			var mesh_instance = MeshInstance3D.new()
 			mesh_instance.mesh = mesh
@@ -541,77 +617,378 @@ func load_obj_model(path: String) -> Node3D:
 	return root if root.get_child_count() > 0 else null
 
 func setup_model_defaults(model: Node3D) -> void:
-	if model:
-		for child in _get_all_children(model):
-			if child is MeshInstance3D:
-				_apply_materials(child)
-				child.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	if !model:
+		return
+
+	for child in _get_all_children(model):
+		if child is MeshInstance3D:
+			_configure_mesh_materials(child)
+			child.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+
+
+func _configure_mesh_materials(mesh_instance: MeshInstance3D) -> void:
+	if !mesh_instance.mesh:
+		return
+
+	for surface_idx in range(mesh_instance.mesh.get_surface_count()):
+		var surface_material = mesh_instance.mesh.surface_get_material(surface_idx)
+		if surface_material and surface_material is StandardMaterial3D:
+			surface_material.resource_local_to_scene = true
+			surface_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+			surface_material.no_depth_test = false
+			continue
+
+		if surface_material == null:
+			var default_material := StandardMaterial3D.new()
+			default_material.albedo_color = Color(0.8, 0.8, 0.8, 1.0)
+			default_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+			default_material.roughness = 0.7
+			default_material.metallic = 0.0
+			mesh_instance.mesh.surface_set_material(surface_idx, default_material)
+
+
+func _normalize_uri_path(uri: String) -> String:
+	return uri.uri_decode().replace("\\", "/")
+
+
+func _is_supported_image_file(path: String) -> bool:
+	return GLTF_TEXTURE_EXTENSIONS.has(path.get_extension().to_lower())
+
+
+func _extract_texture_file_name(uri: String) -> String:
+	var file_name := _normalize_uri_path(uri).get_file()
+	if file_name.is_empty():
+		return ""
+
+	var lower_name := file_name.to_lower()
+	if lower_name.ends_with(".import"):
+		file_name = file_name.substr(0, file_name.length() - ".import".length())
+		lower_name = file_name.to_lower()
+
+	if lower_name.ends_with(".ctex"):
+		file_name = file_name.substr(0, file_name.length() - ".ctex".length())
+		lower_name = file_name.to_lower()
+
+	for extension in GLTF_TEXTURE_EXTENSIONS:
+		var extension_text: String = str(extension)
+		var marker: String = "." + extension_text + "-"
+		var marker_pos: int = lower_name.find(marker)
+		if marker_pos >= 0:
+			return file_name.substr(0, marker_pos + extension_text.length() + 1)
+
+	return file_name
+
+
+func _get_asset_search_roots(base_path: String) -> Array:
+	var roots: Array = []
+	var current_dir := base_path
+
+	for _i in range(5):
+		if current_dir.is_empty():
+			break
+		if !roots.has(current_dir) and DirAccess.open(current_dir) != null:
+			roots.append(current_dir)
+
+		var parent_dir := current_dir.get_base_dir()
+		if parent_dir == current_dir or parent_dir.is_empty():
+			break
+		current_dir = parent_dir
+
+	return roots
+
+
+func _find_file_recursive(root_path: String, target_file_lower: String, depth_left: int) -> String:
+	if depth_left < 0 or root_path.is_empty() or target_file_lower.is_empty():
+		return ""
+
+	var dir := DirAccess.open(root_path)
+	if dir == null:
+		return ""
+
+	dir.list_dir_begin()
+	while true:
+		var entry_name := dir.get_next()
+		if entry_name.is_empty():
+			break
+		if entry_name == "." or entry_name == "..":
+			continue
+
+		var entry_path := root_path.path_join(entry_name)
+		if dir.current_is_dir():
+			var lower_dir_name := entry_name.to_lower()
+			if lower_dir_name in [".git", ".godot", "node_modules", "bin", "obj"]:
+				continue
+			var found_path := _find_file_recursive(entry_path, target_file_lower, depth_left - 1)
+			if !found_path.is_empty():
+				dir.list_dir_end()
+				return found_path
+		else:
+			if entry_name.to_lower() == target_file_lower:
+				dir.list_dir_end()
+				return entry_path
+
+	dir.list_dir_end()
+	return ""
+
+
+func _get_direct_asset_candidates(uri: String, base_path: String) -> Array:
+	var normalized_uri := _normalize_uri_path(uri)
+	var candidates: Array = []
+
+	if normalized_uri.begins_with("res://godotimported/") or normalized_uri.get_extension().to_lower() == "ctex":
+		return candidates
+
+	if normalized_uri.begins_with("res://") or normalized_uri.begins_with("user://") or normalized_uri.is_absolute_path():
+		candidates.append(normalized_uri)
+	else:
+		candidates.append(base_path.path_join(normalized_uri))
+		candidates.append(base_path.path_join(normalized_uri.get_file()))
+
+	return candidates
+
+
+func _resolve_external_asset_path(uri: String, base_path: String, must_be_image: bool) -> String:
+	var normalized_uri := _normalize_uri_path(uri)
+	var file_name := _extract_texture_file_name(normalized_uri) if must_be_image else normalized_uri.get_file()
+
+	for candidate in _get_direct_asset_candidates(normalized_uri, base_path):
+		if FileAccess.file_exists(candidate):
+			if !must_be_image or _is_supported_image_file(candidate):
+				return candidate
+
+	for root_path in _get_asset_search_roots(base_path):
+		var found_path := _find_file_recursive(root_path, file_name.to_lower(), 6)
+		if !found_path.is_empty() and FileAccess.file_exists(found_path):
+			if !must_be_image or _is_supported_image_file(found_path):
+				return found_path
+
+	return ""
+
+
+func _ensure_gltf_cache_dir() -> String:
+	var cache_dir := ProjectSettings.globalize_path(GLTF_CACHE_DIR)
+	DirAccess.make_dir_recursive_absolute(cache_dir)
+	return cache_dir
+
+
+func _get_or_create_fallback_texture_path(cache_dir: String) -> String:
+	var fallback_path := cache_dir.path_join(FALLBACK_TEXTURE_FILE_NAME)
+	if FileAccess.file_exists(fallback_path):
+		return fallback_path
+
+	var fallback_file := FileAccess.open(fallback_path, FileAccess.WRITE)
+	if fallback_file == null:
+		return ""
+
+	fallback_file.store_buffer(Marshalls.base64_to_raw(FALLBACK_PNG_BASE64))
+	fallback_file.close()
+	return fallback_path
+
+
+func _copy_file_to_path(source_path: String, target_path: String) -> bool:
+	var source_file := FileAccess.open(source_path, FileAccess.READ)
+	if source_file == null:
+		return false
+
+	var bytes := source_file.get_buffer(source_file.get_length())
+	source_file.close()
+
+	var target_file := FileAccess.open(target_path, FileAccess.WRITE)
+	if target_file == null:
+		return false
+
+	target_file.store_buffer(bytes)
+	target_file.close()
+	return true
+
+
+func _make_cached_asset_name(model_path: String, asset_type: String, index: int, source_path: String) -> String:
+	var model_name := model_path.get_file().get_basename().replace(" ", "_")
+	var source_name := source_path.get_file().replace(" ", "_")
+	return "%s_%s_%d_%s" % [model_name, asset_type, index, source_name]
+
+
+func _get_image_mime_type(image_path: String) -> String:
+	match image_path.get_extension().to_lower():
+		"jpg", "jpeg":
+			return "image/jpeg"
+		"webp":
+			return "image/webp"
+		"bmp":
+			return "image/bmp"
+		"tga":
+			return "image/tga"
+		"hdr":
+			return "image/vnd.radiance"
+		"exr":
+			return "image/aces"
+		_:
+			return "image/png"
+
+
+func _prepare_gltf_for_loading(path: String) -> String:
+	if path.get_extension().to_lower() != "gltf":
+		return path
+
+	var source_file := FileAccess.open(path, FileAccess.READ)
+	if source_file == null:
+		return path
+
+	var gltf_text := source_file.get_as_text()
+	source_file.close()
+
+	var parsed = JSON.parse_string(gltf_text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return path
+
+	var gltf_data: Dictionary = parsed
+	var base_path := path.get_base_dir()
+	var cache_dir := _ensure_gltf_cache_dir()
+	var fallback_texture_path := _get_or_create_fallback_texture_path(cache_dir)
+	var changed := false
+
+	var images: Array = gltf_data.get("images", [])
+	for i in range(images.size()):
+		if typeof(images[i]) != TYPE_DICTIONARY:
+			continue
+
+		var image_info: Dictionary = images[i]
+		if !image_info.has("uri"):
+			continue
+
+		var image_uri := str(image_info["uri"])
+		if image_uri.begins_with("data:"):
+			continue
+
+		var resolved_image_path := _resolve_external_asset_path(image_uri, base_path, true)
+		if resolved_image_path.is_empty():
+			if fallback_texture_path.is_empty():
+				push_warning("glTF texture not found and fallback texture could not be created: " + image_uri)
+				continue
+			push_warning("glTF texture not found, fallback texture will be used: " + image_uri)
+			image_info["uri"] = fallback_texture_path.get_file()
+			image_info["mimeType"] = "image/png"
+			image_info.erase("bufferView")
+			images[i] = image_info
+			changed = true
+			continue
+
+		var cached_image_name := _make_cached_asset_name(path, "image", i, resolved_image_path)
+		var cached_image_path := cache_dir.path_join(cached_image_name)
+		if _copy_file_to_path(resolved_image_path, cached_image_path):
+			image_info["uri"] = cached_image_name
+			image_info["mimeType"] = _get_image_mime_type(resolved_image_path)
+			image_info.erase("bufferView")
+			images[i] = image_info
+			changed = true
+			print("glTF texture resolved: ", image_uri, " -> ", resolved_image_path)
+		else:
+			if fallback_texture_path.is_empty():
+				push_warning("Could not copy glTF texture and fallback texture could not be created: " + resolved_image_path)
+				continue
+			push_warning("Could not copy glTF texture, fallback texture will be used: " + resolved_image_path)
+			image_info["uri"] = fallback_texture_path.get_file()
+			image_info["mimeType"] = "image/png"
+			image_info.erase("bufferView")
+			images[i] = image_info
+			changed = true
+
+	gltf_data["images"] = images
+
+	if changed:
+		var buffers: Array = gltf_data.get("buffers", [])
+		for i in range(buffers.size()):
+			if typeof(buffers[i]) != TYPE_DICTIONARY:
+				continue
+
+			var buffer_info: Dictionary = buffers[i]
+			if !buffer_info.has("uri"):
+				continue
+
+			var buffer_uri := str(buffer_info["uri"])
+			if buffer_uri.begins_with("data:"):
+				continue
+
+			var resolved_buffer_path := _resolve_external_asset_path(buffer_uri, base_path, false)
+			if resolved_buffer_path.is_empty():
+				var normalized_buffer_uri := _normalize_uri_path(buffer_uri)
+				var absolute_buffer_candidate: String = normalized_buffer_uri if normalized_buffer_uri.is_absolute_path() else base_path.path_join(normalized_buffer_uri)
+				push_warning("glTF buffer could not be copied. Keeping absolute buffer reference: " + absolute_buffer_candidate)
+				buffer_info["uri"] = absolute_buffer_candidate
+				buffers[i] = buffer_info
+				continue
+
+			var cached_buffer_name := _make_cached_asset_name(path, "buffer", i, resolved_buffer_path)
+			var cached_buffer_path := cache_dir.path_join(cached_buffer_name)
+			if _copy_file_to_path(resolved_buffer_path, cached_buffer_path):
+				buffer_info["uri"] = cached_buffer_name
+			else:
+				push_warning("Could not copy glTF buffer. Keeping absolute buffer reference: " + resolved_buffer_path)
+				buffer_info["uri"] = resolved_buffer_path
+			buffers[i] = buffer_info
+
+		gltf_data["buffers"] = buffers
+
+	if !changed:
+		return path
+
+	var patched_path := cache_dir.path_join(path.get_file().get_basename() + "_patched.gltf")
+	var patched_file := FileAccess.open(patched_path, FileAccess.WRITE)
+	if patched_file == null:
+		return path
+
+	patched_file.store_string(JSON.stringify(gltf_data, "\t"))
+	patched_file.close()
+	return patched_path
 
 func load_gltf_model(path: String) -> Node3D:
-	var doc = GLTFDocument.new()
-	var state = GLTFState.new()
-	var err = ERR_FILE_NOT_FOUND
-	
+	var doc := GLTFDocument.new()
+	var state := GLTFState.new()
+	var err := ERR_FILE_NOT_FOUND
+	var extension := path.get_extension().to_lower()
+	var load_path := path
+	var base_path := path.get_base_dir()
+
 	state.handle_binary_image = true
 	state.use_named_skin_binds = true
-	
-	var base_path = path.get_base_dir()
-	
-	var texture_path = base_path.path_join("spacebits_texture.png")
-	if FileAccess.file_exists(texture_path):
-		print("Found texture at:", texture_path)
-	else:
-		print("Texture not found at:", texture_path)
-		var parent_dir = base_path.get_base_dir()
-		texture_path = parent_dir.path_join("spacebits_texture.png")
-		if FileAccess.file_exists(texture_path):
-			print("Found texture in parent dir:", texture_path)
-	
-	if path.get_extension().to_lower() == "glb":
-		var file = FileAccess.open(path, FileAccess.READ)
+
+	if extension == "gltf":
+		load_path = _prepare_gltf_for_loading(path)
+		base_path = load_path.get_base_dir()
+
+	if extension == "glb":
+		var file := FileAccess.open(path, FileAccess.READ)
 		if !file:
 			push_error("Failed to open GLB file: " + path)
 			return null
-		var bytes = file.get_buffer(file.get_length())
+		var bytes := file.get_buffer(file.get_length())
 		file.close()
 		err = doc.append_from_buffer(bytes, base_path, state)
 	else:
-		err = doc.append_from_file(path, state)
-	
+		err = doc.append_from_file(load_path, state)
+
 	if err != OK:
 		push_error("Error parsing GLTF/GLB file: " + str(err))
 		return null
-	
-	var scene = doc.generate_scene(state)
+
+	var scene := doc.generate_scene(state)
 	if !scene:
 		push_error("Failed to generate scene")
 		return null
-	
-	var root = Node3D.new()
+
+	var root := Node3D.new()
+	root.name = path.get_file().get_basename()
 	root.add_child(scene)
 	scene.owner = root
-	
+
 	for node in _get_all_children(root):
 		if node is MeshInstance3D:
-			for surface_idx in range(node.mesh.get_surface_count()):
-				var material = node.mesh.surface_get_material(surface_idx)
-				if material:
-					material.resource_local_to_scene = true
-					if material is StandardMaterial3D:
-						material.cull_mode = BaseMaterial3D.CULL_DISABLED
-						if material.albedo_texture == null and material.get_name() == "spacebits_texture":
-							if FileAccess.file_exists(texture_path):
-								var image = Image.new()
-								var err2 = image.load(texture_path)
-								if err2 == OK:
-									var texture = ImageTexture.create_from_image(image)
-									material.albedo_texture = texture
+			_configure_mesh_materials(node)
 			node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
-	
+
 	root.transform = Transform3D.IDENTITY
-	scene.transform = Transform3D.IDENTITY
-	
 	return root
+
 
 func _setup_gltf_materials(mesh_instance: MeshInstance3D) -> void:
 	if !mesh_instance.mesh:
@@ -632,62 +1009,148 @@ func _setup_gltf_materials(mesh_instance: MeshInstance3D) -> void:
 
 func load_model_from_path(path: String) -> Node3D:
 	var model: Node3D = null
-	var extension = path.get_extension().to_lower()
-	
+	var extension := path.get_extension().to_lower()
+
 	if extension == "obj":
 		model = load_obj_model(path)
 	elif extension in ["gltf", "glb"]:
 		model = load_gltf_model(path)
-	
+	elif extension == "fbx":
+		model = load_fbx_model(path)
+
 	if model:
-		var saved_orbit_center = orbit_center
-		
 		model.transform = Transform3D.IDENTITY
-		for child in _get_all_children(model):
-			if child is Node3D:
-				child.transform = Transform3D.IDENTITY
-		
-		var meshes := []
-		for child in _get_all_children(model):
-			if child is MeshInstance3D:
-				meshes.append(child)
-		
-		if meshes.is_empty():
-			return model
-			
-		var aabb := AABB()
-		var first = true
-		
-		for mesh_instance in meshes:
-			var mesh_aabb := (mesh_instance as MeshInstance3D).get_aabb()
-			if first:
-				aabb = mesh_aabb
-				first = false
+		setup_model_defaults(model)
+
+	return model
+
+
+func load_fbx_model(path: String) -> Node3D:
+	# FBXDocument is available in Godot 4.4+.
+	# Falls back gracefully if the class does not exist in the build.
+	if !ClassDB.class_exists("FBXDocument"):
+		push_error("FBXDocument not available in this Godot build.")
+		return null
+
+	var doc  = ClassDB.instantiate("FBXDocument")
+	var state = ClassDB.instantiate("FBXState")
+	if !doc or !state:
+		push_error("Failed to instantiate FBXDocument/FBXState.")
+		return null
+
+	# Allow the importer to find textures next to the FBX file.
+	var base_path := path.get_base_dir()
+	var err: int = doc.append_from_file(path, state, 0, base_path)
+	if err != OK:
+		push_error("FBX parse error (%d): %s" % [err, path])
+		return null
+
+	var scene: Node = doc.generate_scene(state)
+	if !scene:
+		push_error("FBX generate_scene failed: " + path)
+		return null
+
+	var root := Node3D.new()
+	root.name = path.get_file().get_basename()
+	root.add_child(scene)
+	scene.owner = root
+
+	for node in _get_all_children(root):
+		if node is MeshInstance3D:
+			_configure_mesh_materials(node)
+			node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+
+	root.transform = Transform3D.IDENTITY
+
+	# Textures in FBX often use absolute paths from the original machine.
+	# Scan the folder next to the FBX and apply matching images manually
+	# using Image.load_from_file() which bypasses ResourceLoader restrictions.
+	_apply_fbx_textures(root, base_path)
+
+	return root
+
+
+## Scans base_dir (and its sub-folders) for image files and tries to match
+## them to untextured StandardMaterial3D surfaces by name similarity.
+func _apply_fbx_textures(root: Node3D, base_dir: String) -> void:
+	var tex_map: Dictionary = {}   # basename_lower → full_path
+	_scan_images_recursive(base_dir, tex_map)
+	if tex_map.is_empty():
+		return
+
+	for node in _get_all_children(root):
+		if not node is MeshInstance3D:
+			continue
+		var mi := node as MeshInstance3D
+		if !mi.mesh:
+			continue
+		for surf in range(mi.mesh.get_surface_count()):
+			var mat = mi.get_active_material(surf)
+			if not mat is StandardMaterial3D:
+				continue
+			var sm := mat as StandardMaterial3D
+			if sm.albedo_texture:
+				continue  # already has a texture
+
+			# Build candidate names from mesh / material / surface names.
+			var candidates: Array[String] = []
+			if mi.name:            candidates.append(mi.name.to_lower())
+			if sm.resource_name:   candidates.append(sm.resource_name.to_lower())
+
+			# First try exact/contains match, then fall back to any "color"
+			# or "diffuse" texture found in the folder.
+			var chosen := _find_best_texture(candidates, tex_map)
+			if chosen.is_empty():
+				chosen = _find_texture_keyword(["color", "diffuse", "albedo",
+												"col", "base"], tex_map)
+			if chosen.is_empty():
+				continue
+
+			var img := Image.load_from_file(chosen)
+			if img:
+				sm.albedo_texture = ImageTexture.create_from_image(img)
+
+
+func _find_best_texture(candidates: Array[String],
+						tex_map: Dictionary) -> String:
+	for cand in candidates:
+		if cand.is_empty():
+			continue
+		for k: String in tex_map:
+			if k.contains(cand) or cand.contains(k):
+				return tex_map[k]
+	return ""
+
+
+func _find_texture_keyword(keywords: Array[String],
+							tex_map: Dictionary) -> String:
+	for kw in keywords:
+		for k: String in tex_map:
+			if k.contains(kw):
+				return tex_map[k]
+	return ""
+
+
+func _scan_images_recursive(dir_path: String, result: Dictionary) -> void:
+	var dir := DirAccess.open(dir_path)
+	if !dir:
+		return
+	dir.list_dir_begin()
+	var fname := dir.get_next()
+	while fname != "":
+		if fname != "." and fname != "..":
+			var full := dir_path.path_join(fname)
+			if dir.current_is_dir():
+				_scan_images_recursive(full, result)
 			else:
-				aabb = aabb.merge(mesh_aabb)
-		
-		var offset := -aabb.get_center()
-		model.position = offset
-		
-		if saved_settings_loaded and saved_orbit_center.length() > 0.001:
-			model.position = offset + saved_orbit_center
-			orbit_center = saved_orbit_center
-		else:
-			orbit_center = Vector3.ZERO
-	
-	if model:
-		var model_details = get_model_details()
-		if owner and owner.model_info_panel:
-			owner.model_info_panel.update_info(model_details)
-	
-	return model
-	
-	if model:
-		var model_details = get_model_details()
-		if owner and owner.model_info_panel:
-			owner.model_info_panel.update_info(model_details)
-	
-	return model
+				var ext := fname.get_extension().to_lower()
+				if ext in ["jpg", "jpeg", "png", "webp", "bmp", "tga", "hdr"]:
+					var base := fname.get_basename().to_lower()
+					if not result.has(base):
+						result[base] = full
+		fname = dir.get_next()
+	dir.list_dir_end()
+
 
 func _apply_materials(mesh_instance: MeshInstance3D) -> void:
 	if !mesh_instance.mesh:
@@ -731,27 +1194,26 @@ func _apply_materials(mesh_instance: MeshInstance3D) -> void:
 func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMaterial, model_path: String) -> void:
 	if !mesh_instance.mesh:
 		return
-	
-	var material = StandardMaterial3D.new()
-	
-	material.vertex_color_use_as_albedo = true
-	material.metallic_specular = 0.1
-	material.cull_mode = BaseMaterial3D.CULL_DISABLED
-	material.no_depth_test = false
-	
-	material.albedo_color = mtl_data.albedo_color
-	material.metallic = mtl_data.metallic
-	material.roughness = mtl_data.roughness
-	material.emission = mtl_data.emission
-	material.emission_energy = mtl_data.emission_energy
-	
+
+	var generated_material := StandardMaterial3D.new()
+	generated_material.vertex_color_use_as_albedo = true
+	generated_material.metallic_specular = 0.1
+	generated_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	generated_material.no_depth_test = false
+
+	generated_material.albedo_color = mtl_data.albedo_color
+	generated_material.metallic = mtl_data.metallic
+	generated_material.roughness = mtl_data.roughness
+	generated_material.emission = mtl_data.emission
+	generated_material.emission_energy = mtl_data.emission_energy
+
 	for texture_type in mtl_data.texture_paths:
 		var texture_path = mtl_data.texture_paths[texture_type]
 		if !texture_path.is_empty():
 			var normalized_texture_path = texture_path.replace("\\", "/")
 			var base_dir = model_path.get_base_dir()
 			var full_path = base_dir.path_join(normalized_texture_path)
-			
+
 			var possible_paths = [
 				full_path,
 				base_dir.path_join(normalized_texture_path.get_file()),
@@ -759,13 +1221,13 @@ func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMate
 				base_dir.path_join(normalized_texture_path.to_lower()),
 				base_dir.path_join(normalized_texture_path.to_upper())
 			]
-			
+
 			var valid_path = ""
-			for path in possible_paths:
-				if FileAccess.file_exists(path):
-					valid_path = path
+			for path_candidate in possible_paths:
+				if FileAccess.file_exists(path_candidate):
+					valid_path = path_candidate
 					break
-					
+
 			if valid_path != "":
 				var image = Image.new()
 				var err = image.load(valid_path)
@@ -773,50 +1235,61 @@ func _apply_material_properties(mesh_instance: MeshInstance3D, mtl_data: MTLMate
 					var texture = ImageTexture.create_from_image(image)
 					match texture_type:
 						"albedo":
-							material.albedo_texture = texture
+							generated_material.albedo_texture = texture
 						"normal":
-							material.normal_texture = texture
-							material.normal_enabled = true
+							generated_material.normal_texture = texture
+							generated_material.normal_enabled = true
+							generated_material.normal_scale = mtl_data.normal_scale
 						"metallic":
-							material.metallic_texture = texture
+							generated_material.metallic_texture = texture
 						"roughness":
-							material.roughness_texture = texture
-				else:
-					push_error("Failed to load texture: %s, error: %s" % [valid_path, err])
-			else:
-				push_warning("Could not find texture: %s" % texture_path)
-	
-	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-	material.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
-	material.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
-	
-	for i in range(mesh_instance.mesh.get_surface_count()):
-		mesh_instance.mesh.surface_set_material(i, material)
+							generated_material.roughness_texture = texture
+						"emission":
+							generated_material.emission_texture = texture
+							generated_material.emission_enabled = true
+						"ao":
+							generated_material.ao_texture = texture
+							generated_material.ao_enabled = true
+							generated_material.ao_light_affect = mtl_data.ao_strength
 
-func _setup_material_properties(material: StandardMaterial3D) -> void:
-	material.cull_mode = BaseMaterial3D.CULL_DISABLED
-	material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
-	material.vertex_color_use_as_albedo = true
-	
-	if material.albedo_color.a < 1.0:
-		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
-		material.alpha_scissor_threshold = 0.5
-		material.alpha_antialiasing_mode = BaseMaterial3D.ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE
+	if mtl_data.alpha < 1.0:
+		generated_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
+		generated_material.alpha_scissor_threshold = 0.1
 	else:
-		material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
-	
-	if material.albedo_texture:
-		material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
-		material.texture_repeat = true
+		generated_material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+
+	generated_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+	generated_material.diffuse_mode = BaseMaterial3D.DIFFUSE_BURLEY
+	generated_material.specular_mode = BaseMaterial3D.SPECULAR_SCHLICK_GGX
+
+	for i in range(mesh_instance.mesh.get_surface_count()):
+		mesh_instance.mesh.surface_set_material(i, generated_material)
+
+
+func _setup_material_properties(surface_material: StandardMaterial3D) -> void:
+	surface_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	surface_material.shading_mode = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+
+	if surface_material.albedo_color.a < 1.0:
+		surface_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
+		surface_material.alpha_scissor_threshold = 0.5
+		surface_material.alpha_antialiasing_mode = BaseMaterial3D.ALPHA_ANTIALIASING_ALPHA_TO_COVERAGE
+	else:
+		surface_material.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+
+	if surface_material.albedo_texture:
+		surface_material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+		surface_material.texture_repeat = true
+
 
 func fix_materials(model: Node3D):
 	for child in model.get_children():
 		if child is MeshInstance3D:
-			var material = child.get_surface_override_material(0)
-			if material == null:
-				material = StandardMaterial3D.new()
-			material.cull_mode = BaseMaterial3D.CULL_DISABLED
-			child.set_surface_override_material(0, material)
+			var override_material = child.get_surface_override_material(0)
+			if override_material == null:
+				override_material = StandardMaterial3D.new()
+			override_material.cull_mode = BaseMaterial3D.CULL_DISABLED
+			child.set_surface_override_material(0, override_material)
 			
 func clear_model():
 	if current_model:
@@ -860,6 +1333,7 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_LEFT:
 			is_dragging = event.pressed
+			dragging = is_dragging
 			if is_dragging:
 				last_mouse_position = event.position
 				if is_rotating:
@@ -950,46 +1424,47 @@ func get_model_max_distance() -> float:
 func get_model_details() -> Dictionary:
 	if !current_model:
 		return {}
-		
+
 	var details = {
 		"materials_data": [],
 		"textures_data": [],
 		"animations_data": []
 	}
-	
+
 	for child in _get_all_children(current_model):
 		if child is MeshInstance3D:
 			var mesh = child.mesh
 			if mesh:
 				for surface_idx in range(mesh.get_surface_count()):
-					var material = mesh.surface_get_material(surface_idx)
-					if material:
+					var surface_material = mesh.surface_get_material(surface_idx)
+					if surface_material:
 						var mat_info = {
-							"name": material.resource_name if material.resource_name else "Material " + str(surface_idx),
-							"type": material.get_class(),
+							"name": surface_material.resource_name if surface_material.resource_name else "Material " + str(surface_idx),
+							"type": surface_material.get_class(),
 							"properties": {}
 						}
-						
-						if material is StandardMaterial3D:
+
+						if surface_material is StandardMaterial3D:
 							mat_info.properties = {
-								"albedo_color": material.albedo_color,
-								"metallic": material.metallic,
-								"roughness": material.roughness,
-								"emission_enabled": material.emission_enabled,
-								"normal_enabled": material.normal_enabled
+								"albedo_color": surface_material.albedo_color,
+								"metallic": surface_material.metallic,
+								"roughness": surface_material.roughness,
+								"emission_enabled": surface_material.emission_enabled,
+								"normal_enabled": surface_material.normal_enabled
 							}
-							
-							if material.albedo_texture:
+
+							if surface_material.albedo_texture:
 								details.textures_data.append({
 									"name": "Albedo " + mat_info.name,
-									"texture": material.albedo_texture
+									"texture": surface_material.albedo_texture
 								})
-							if material.normal_texture:
+
+							if surface_material.normal_texture:
 								details.textures_data.append({
 									"name": "Normal " + mat_info.name,
-									"texture": material.normal_texture
+									"texture": surface_material.normal_texture
 								})
-						
+
 						details.materials_data.append(mat_info)
 
 	var animation_player = _find_animation_player(current_model)
@@ -1002,6 +1477,7 @@ func get_model_details() -> Dictionary:
 					"length": animation.length,
 					"player": animation_player
 				})
+
 	return details
 
 func _on_texture_pressed(texture: Dictionary):
@@ -1023,40 +1499,41 @@ func _on_texture_pressed(texture: Dictionary):
 	add_child(preview_window)
 	preview_window.popup_centered()
 
-func _create_material_preview(material: Dictionary) -> Control:
+func _create_material_preview(material_info: Dictionary) -> Control:
 	var preview = VBoxContainer.new()
 	preview.add_theme_constant_override("separation", 10)
-	
-	if material.has("properties"):
-		for prop_name in material.properties:
-			var prop_value = material.properties[prop_name]
+
+	if material_info.has("properties"):
+		for prop_name in material_info.properties:
+			var prop_value = material_info.properties[prop_name]
 			var property_label = Label.new()
 			property_label.text = str(prop_name) + ": " + str(prop_value)
 			preview.add_child(property_label)
-	
+
 	return preview
 
-func _get_material_info(material: Material) -> Dictionary:
+
+func _get_material_info(surface_material: Material) -> Dictionary:
 	var info = {
-		"name": material.resource_name if material.resource_name else "Unnamed Material",
-		"type": material.get_class()
+		"name": surface_material.resource_name if surface_material.resource_name else "Unnamed Material",
+		"type": surface_material.get_class()
 	}
-	
-	if material is StandardMaterial3D:
+
+	if surface_material is StandardMaterial3D:
 		info["properties"] = {
-			"albedo_color": material.albedo_color,
-			"metallic": material.metallic,
-			"metallic_specular": material.metallic_specular,
-			"roughness": material.roughness,
-			"emission_enabled": material.emission_enabled,
-			"emission": material.emission,
-			"normal_enabled": material.normal_enabled,
-			"rim_enabled": material.rim_enabled,
-			"clearcoat_enabled": material.clearcoat_enabled,
-			"ao_enabled": material.ao_enabled,
-			"transparency": material.transparency
+			"albedo_color": surface_material.albedo_color,
+			"metallic": surface_material.metallic,
+			"metallic_specular": surface_material.metallic_specular,
+			"roughness": surface_material.roughness,
+			"emission_enabled": surface_material.emission_enabled,
+			"emission": surface_material.emission,
+			"normal_enabled": surface_material.normal_enabled,
+			"rim_enabled": surface_material.rim_enabled,
+			"clearcoat_enabled": surface_material.clearcoat_enabled,
+			"ao_enabled": surface_material.ao_enabled,
+			"transparency": surface_material.transparency
 		}
-	
+
 	return info
 
 func play_animation(animation_name: String, player: AnimationPlayer):
@@ -1105,30 +1582,14 @@ func _get_all_children(node: Node) -> Array:
 func get_model_size() -> float:
 	if !current_model:
 		return 2.0
-	
-	var aabb := AABB()
-	var has_mesh := false
-	
-	for child in _get_all_children(current_model):
-		if child is MeshInstance3D:
-			var mesh_instance := child as MeshInstance3D
-			var mesh_aabb := mesh_instance.get_aabb()
-			
-			if !has_mesh:
-				aabb = mesh_aabb
-				has_mesh = true
-			else:
-				aabb = aabb.merge(mesh_aabb)
-	
-	if has_mesh:
-		var size: float = max(aabb.size.x, max(aabb.size.y, aabb.size.z))
-		if size < 0.1:
-			return 2.0
-		elif size > 1000.0:
-			return 10.0
-		return size
-	
+
+	var aabb_info := _get_model_aabb(current_model)
+	if bool(aabb_info["has_mesh"]):
+		var model_extent := _get_aabb_max_axis(aabb_info["aabb"])
+		return clamp(model_extent, 0.1, 1000.0)
+
 	return 2.0
+
 
 func toggle_rotation() -> void:
 	is_rotating = !is_rotating
@@ -1174,52 +1635,32 @@ func update_camera_position() -> void:
 func center_camera_on_model() -> void:
 	if !current_model:
 		return
-	
-	var combined_aabb := AABB()
-	var first_mesh := true
-	var mesh_count := 0
-	
-	for child in _get_all_children(current_model):
-		if child is MeshInstance3D:
-			var mesh_instance := child as MeshInstance3D
-			var mesh_aabb := mesh_instance.get_aabb()
-			var global_transform := mesh_instance.global_transform
-			
-			var transformed_aabb := AABB(
-				global_transform * mesh_aabb.position,
-				mesh_aabb.size
-			)
-			
-			if first_mesh:
-				combined_aabb = transformed_aabb
-				first_mesh = false
-			else:
-				combined_aabb = combined_aabb.merge(transformed_aabb)
-			
-			mesh_count += 1
-	
-	if mesh_count == 0:
+
+	var aabb_info := _get_model_aabb(current_model)
+	if !bool(aabb_info["has_mesh"]):
 		print("Warning: No meshes found in model")
 		return
-		
-	var model_size := combined_aabb.size.length()
+
+	var combined_aabb: AABB = aabb_info["aabb"]
+	var model_extent := _get_aabb_max_axis(combined_aabb)
 	var model_center := combined_aabb.get_center()
-	
-	current_model.global_position = -model_center
+
+	current_model.global_position -= model_center
 	orbit_center = Vector3.ZERO
-	
+
 	if !saved_settings_loaded:
-		camera_distance = model_size * 2.0
+		camera_distance = max(model_extent * 2.0, 2.0)
 		camera_horizontal_angle = 0.0
-		camera_vertical_angle = PI/4
-	
+		camera_vertical_angle = PI / 4
+
 	camera_distance = clamp(
 		camera_distance,
-		model_size * 0.5,
-		model_size * 10.0
+		max(model_extent * 0.5, 0.1),
+		max(model_extent * 10.0, 1.0)
 	)
-	
+
 	update_camera_position()
+
 
 func setup_preview_camera() -> void:
 	if !preview_camera:
@@ -1249,8 +1690,9 @@ func setup_environment() -> void:
 	environment.ambient_light_color = Color(0.4, 0.4, 0.4)
 	environment.ambient_light_energy = 1.5
 	
-	environment.ssr_enabled = true
-	environment.ssao_enabled = true
+	# SSR/SSAO are disabled here because they warn or do not work under Mobile/Compatibility renderers.
+	environment.ssr_enabled = false
+	environment.ssao_enabled = false
 	environment.glow_enabled = true
 	environment.glow_intensity = 0.5
 	environment.glow_strength = 1.0
@@ -1293,6 +1735,7 @@ func setup_viewport() -> void:
 	preview_viewport.mesh_lod_threshold = 0.0
 	preview_viewport.render_target_clear_mode = SubViewport.CLEAR_MODE_ALWAYS
 	preview_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_queue_viewport_resize()
 
 func setup_lighting() -> void:
 	var main_light = DirectionalLight3D.new()
@@ -1341,8 +1784,8 @@ func setup_light() -> void:
 	environment.ssr_enabled = false
 	environment.sdfgi_enabled = false
 	
-	environment.ssao_enabled = true
-	environment.ssao_radius = 0.5
+	environment.ssao_enabled = false
+	# environment.ssao_radius = 0.5
 	environment.ssao_intensity = 1.0
 	environment.ssao_detail = 1.0
 	environment.ssao_horizon = 0.06

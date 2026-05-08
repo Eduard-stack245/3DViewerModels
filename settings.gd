@@ -1,14 +1,15 @@
 extends Node
 
-const SETTINGS_FILE = "user://viewer_settings.cfg"
-const DEFAULT_SETTINGS = {
+const SETTINGS_FILE := "user://viewer_settings.cfg"
+const SAVE_DEBOUNCE_SECONDS := 0.6
+const DEFAULT_SETTINGS := {
 	"last_directory": "",
 	"last_model": "",
 	"auto_rotation": true,
 	"rotation_speed": 0.5,
 	"camera_distance": 5.0,
 	"camera_horizontal_angle": 0.0,
-	"camera_vertical_angle": PI/4,
+	"camera_vertical_angle": PI / 4,
 	"orbit_center_x": 0.0,
 	"orbit_center_y": 0.0,
 	"orbit_center_z": 0.0,
@@ -17,69 +18,92 @@ const DEFAULT_SETTINGS = {
 	"camera_position_z": 0.0,
 	"wasd_position_x": 0.0,
 	"wasd_position_y": 0.0,
-	"wasd_position_z": 0.0
+	"wasd_position_z": 0.0,
+	"animation_playing": false,
+	"current_animation": "",
+	"animation_position": 0.0
 }
 
-var config = ConfigFile.new()
-var current_settings = {}
+var config := ConfigFile.new()
+var current_settings := {}
+var _save_timer: Timer
 
-func _ready():
+
+func _ready() -> void:
 	load_settings()
+	_init_save_timer()
+
+
+func _init_save_timer() -> void:
+	if _save_timer:
+		return
+	_save_timer = Timer.new()
+	_save_timer.one_shot = true
+	_save_timer.wait_time = SAVE_DEBOUNCE_SECONDS
+	_save_timer.timeout.connect(save_settings)
+	add_child(_save_timer)
+
 
 func get_setting(key: String):
-	var value = current_settings.get(key, DEFAULT_SETTINGS.get(key))
-	return value
+	return current_settings.get(key, DEFAULT_SETTINGS.get(key))
 
-func load_settings():
-	if not FileAccess.file_exists(SETTINGS_FILE):
-		print("Settings file does not exist, using defaults")
-		current_settings = DEFAULT_SETTINGS.duplicate()
+
+func load_settings() -> void:
+	if !FileAccess.file_exists(SETTINGS_FILE):
+		current_settings = DEFAULT_SETTINGS.duplicate(true)
 		return
-		
-	var err = config.load(SETTINGS_FILE)
+
+	var err := config.load(SETTINGS_FILE)
 	if err != OK:
-		print("Failed to load settings, using defaults")
-		current_settings = DEFAULT_SETTINGS.duplicate()
+		push_warning("Failed to load settings, using defaults. Error: %s" % err)
+		current_settings = DEFAULT_SETTINGS.duplicate(true)
 		return
-		
+
 	current_settings = {}
 	for key in DEFAULT_SETTINGS:
-		var value = config.get_value("Settings", key, DEFAULT_SETTINGS[key])
-		
-		if typeof(value) != typeof(DEFAULT_SETTINGS[key]):
-			print("Invalid type for setting", key, ", using default")
-			current_settings[key] = DEFAULT_SETTINGS[key]
-			continue
-			
-		match key:
-			"rotation_speed":
-				if value < 0.1 or value > 2.0:
-					value = DEFAULT_SETTINGS[key]
-			"camera_distance":
-				if value <= 0:
-					value = DEFAULT_SETTINGS[key]
-			"camera_vertical_angle":
-				if value < 0.1 or value > PI - 0.1:
-					value = DEFAULT_SETTINGS[key]
-					
-		current_settings[key] = value
+		var value: Variant = config.get_value("Settings", key, DEFAULT_SETTINGS[key])
+		current_settings[key] = _sanitize_setting(key, value)
 
-func save_settings():
-	var dir = DirAccess.open("user://")
-	if not dir:
-		print("Failed to access user directory")
-		return
-		
+
+func _sanitize_setting(key: String, value):
+	var default_value: Variant = DEFAULT_SETTINGS[key]
+	if typeof(value) != typeof(default_value):
+		return default_value
+
+	match key:
+		"rotation_speed":
+			return clamp(float(value), 0.1, 2.0)
+		"camera_distance":
+			return max(float(value), 0.1)
+		"camera_vertical_angle":
+			return clamp(float(value), 0.1, PI - 0.1)
+		_:
+			return value
+
+
+func save_settings() -> void:
+	if _save_timer and !_save_timer.is_stopped():
+		_save_timer.stop()
+
 	for key in current_settings:
 		if key in DEFAULT_SETTINGS:
 			config.set_value("Settings", key, current_settings[key])
-			
-	var err = config.save(SETTINGS_FILE)
-	if err != OK:
-		print("Failed to save settings:", err)
-	else:
-		print("=== Settings saved successfully ===")
 
-func set_setting(key: String, value):
+	var err := config.save(SETTINGS_FILE)
+	if err != OK:
+		push_warning("Failed to save settings: %s" % err)
+
+
+func set_setting(key: String, value, save_now: bool = false) -> void:
 	current_settings[key] = value
-	save_settings()
+	if save_now:
+		save_settings()
+	else:
+		_schedule_save()
+
+
+func _schedule_save() -> void:
+	if !is_inside_tree():
+		return
+	_init_save_timer()
+	_save_timer.start(SAVE_DEBOUNCE_SECONDS)
