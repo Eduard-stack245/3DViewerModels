@@ -21,7 +21,8 @@ const DEFAULT_SETTINGS := {
 	"wasd_position_z": 0.0,
 	"animation_playing": false,
 	"current_animation": "",
-	"animation_position": 0.0
+	"animation_position": 0.0,
+	"recent_models": "[]"
 }
 
 var config := ConfigFile.new()
@@ -107,3 +108,20 @@ func _schedule_save() -> void:
 		return
 	_init_save_timer()
 	_save_timer.start(SAVE_DEBOUNCE_SECONDS)
+
+
+# ── Recent models ──────────────────────────────────────────────────────────────
+func get_recent_models() -> Array:
+	var parsed: Variant = JSON.parse_string(str(get_setting("recent_models")))
+	if typeof(parsed) != TYPE_ARRAY:
+		return []
+	return parsed
+
+
+func add_recent_model(path: String, max_count: int = 10) -> void:
+	var recent: Array = get_recent_models()
+	recent.erase(path)
+	recent.insert(0, path)
+	while recent.size() > max_count:
+		recent.pop_back()
+	set_setting("recent_models", JSON.stringify(recent))

@@ -65,14 +65,47 @@ var camera_pan_speed := 2.0
 var middle_mouse_pressed := false
 var zoom_speed := 1.2
 
-var current_animation_player: AnimationPlayer
-var current_animation: String
+var current_animation_player: AnimationPlayer = null
+var current_animation: String = ""
 var is_playing: bool = false
+var _timeline_updating: bool = false   # prevents seek() feedback loop
+
+enum ViewPreset { FRONT = 0, BACK = 1, LEFT = 2, RIGHT = 3, TOP = 4, BOTTOM = 5 }
+
+var _grid_instance: MeshInstance3D = null
+var grid_visible:   bool           = true
+var _gizmo_overlay: Control        = null
+var gizmo_visible:  bool           = true
+
+var wireframe_enabled:     bool         = false
+var zoom_to_cursor:        bool         = true
+var animation_speed_scale: float        = 1.0
+var _speed_option_btn:     OptionButton = null
+
+# ── Environment & light runtime references ────────────────────────────────────
+var _main_light:         DirectionalLight3D = null
+var _fill_light:         DirectionalLight3D = null
+var _rim_light:          DirectionalLight3D = null
+var _world_env_node:     WorldEnvironment   = null
+var _light_azimuth_deg:  float = -30.0
+var _light_elevation_deg:float = -60.0
+var _light_energy:       float = 2.0
+
+# ── FPS / stats overlay ───────────────────────────────────────────────────────
+var _fps_label:   Label = null
+var _fps_visible: bool  = false
+
+# ── Texture channel debug view ────────────────────────────────────────────────
+# 0 = full, 1 = albedo, 2 = roughness, 3 = normal, 4 = metallic
+var _tex_channel: int = 0
 
 func _ready():
 	await get_tree().process_frame
 	_setup_responsive_viewport()
 	setup_environment()
+	_create_gizmo_overlay()
+	_create_speed_control()
+	_create_fps_overlay()
 
 	mouse_entered.connect(_on_viewport_mouse_entered)
 	mouse_exited.connect(_on_viewport_mouse_exited)
@@ -157,29 +190,53 @@ func _sync_viewport_size() -> void:
 
 
 func _on_play_pause_pressed():
-	if !current_animation_player or !current_animation:
+	if !current_animation_player \
+			or !is_instance_valid(current_animation_player) \
+			or !current_animation:
 		return
-		
+
 	if is_playing:
 		current_animation_player.pause()
-		play_pause_button.text = "▶"
+		is_playing = false
+		if play_pause_button:
+			play_pause_button.text = "▶"
 	else:
 		current_animation_player.play(current_animation)
-		play_pause_button.text = "⏸"
-	is_playing = !is_playing
+		is_playing = true
+		if play_pause_button:
+			play_pause_button.text = "⏸"
 
 	if owner and owner.settings:
 		owner.settings.set_setting("animation_playing", is_playing)
 		owner.settings.set_setting("current_animation", current_animation)
 
 func _on_timeline_changed(value: float):
-	if current_animation_player and current_animation:
-		current_animation_player.seek(value)
-		
+	# Ignore programmatic updates from _process — only react to user input
+	if _timeline_updating:
+		return
+	if current_animation_player and is_instance_valid(current_animation_player) \
+			and current_animation:
+		current_animation_player.seek(value, true)
 		if owner and owner.settings:
 			owner.settings.set_setting("animation_position", value)
 		
 func _process(delta: float) -> void:
+	# FPS/draw-calls overlay — runs even without a loaded model
+	if _fps_visible and _fps_label:
+		var fps: int = Engine.get_frames_per_second()
+		var draws: int = RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
+		_fps_label.text = "FPS: %d\nDraw calls: %d" % [fps, draws]
+
+	# ── Sync timeline slider with animation playback position ────────────────
+	if is_playing \
+			and current_animation_player \
+			and is_instance_valid(current_animation_player) \
+			and timeline_slider and timeline_slider.visible:
+		_timeline_updating = true
+		timeline_slider.value = current_animation_player.current_animation_position
+		_timeline_updating = false
+
 	if !current_model:
 		return
 		
@@ -217,7 +274,10 @@ func _process(delta: float) -> void:
 			owner.settings.set_setting("wasd_position_x", preview_camera.global_position.x)
 			owner.settings.set_setting("wasd_position_y", preview_camera.global_position.y)
 			owner.settings.set_setting("wasd_position_z", preview_camera.global_position.z)
-		
+
+	if _gizmo_overlay and gizmo_visible:
+		_gizmo_overlay.queue_redraw()
+
 func save_camera_settings() -> void:
 	if owner and owner.settings:
 		owner.settings.set_setting("camera_distance", camera_distance)
@@ -362,7 +422,8 @@ func load_in_preview_portal(model_path: String) -> String:
 		owner.settings.set_setting("auto_rotation", is_rotating)
 		owner.settings.set_setting("rotation_speed", auto_rotation_speed)
 		owner.settings.set_setting("camera_distance", camera_distance)
-	
+
+	_update_grid()
 	return "Модель загружена успешно"
 
 func load_mtl_file(mtl_path: String) -> Dictionary:
@@ -1038,22 +1099,30 @@ func load_fbx_model(path: String) -> Node3D:
 		push_error("Failed to instantiate FBXDocument/FBXState.")
 		return null
 
+	# Mirror the same state flags used by load_gltf_model for best compatibility.
+	state.set("use_named_skin_binds", true)
+
 	# Allow the importer to find textures next to the FBX file.
 	var base_path := path.get_base_dir()
 	var err: int = doc.append_from_file(path, state, 0, base_path)
+	# err != OK usually means some textures couldn't be loaded via ResourceLoader
+	# (absolute paths from another machine, etc.).  The mesh geometry is still
+	# present inside `state`, so always attempt generate_scene().
 	if err != OK:
-		push_error("FBX parse error (%d): %s" % [err, path])
-		return null
+		push_warning("FBX: append_from_file code %d for '%s' — continuing." % [err, path.get_file()])
 
 	var scene: Node = doc.generate_scene(state)
 	if !scene:
-		push_error("FBX generate_scene failed: " + path)
+		push_error("FBX generate_scene failed (err=%d): %s" % [err, path])
 		return null
 
 	var root := Node3D.new()
 	root.name = path.get_file().get_basename()
 	root.add_child(scene)
-	scene.owner = root
+
+	# FBXDocument generates ImporterMeshInstance3D nodes instead of MeshInstance3D.
+	# Convert them so the rest of the pipeline (materials, shadows, AABB) works.
+	_convert_importer_meshes(root)
 
 	for node in _get_all_children(root):
 		if node is MeshInstance3D:
@@ -1068,6 +1137,50 @@ func load_fbx_model(path: String) -> Node3D:
 	_apply_fbx_textures(root, base_path)
 
 	return root
+
+
+## FBXDocument produces ImporterMeshInstance3D nodes at runtime.
+## This function replaces every such node with a proper MeshInstance3D so that
+## the rest of the viewer pipeline (AABB, materials, shadows) works correctly.
+func _convert_importer_meshes(root: Node) -> void:
+	# Snapshot the list first — we'll be modifying the tree during iteration.
+	var all_nodes: Array = _get_all_children(root)
+
+	for node in all_nodes:
+		if node.get_class() != "ImporterMeshInstance3D":
+			continue
+		if !is_instance_valid(node):
+			continue
+
+		# ImporterMeshInstance3D.mesh → ImporterMesh → get_mesh() → ArrayMesh
+		var importer_mesh: Object = node.get("mesh")
+		if !importer_mesh:
+			continue
+		var array_mesh: ArrayMesh = importer_mesh.call("get_mesh")
+		if !array_mesh:
+			continue
+
+		var mi := MeshInstance3D.new()
+		mi.name        = node.name
+		mi.transform   = (node as Node3D).transform
+		mi.mesh        = array_mesh
+
+		# Transfer skeletal skinning so animations deform the mesh correctly.
+		var skin: Object = node.get("skin")
+		if skin is Skin:
+			mi.skin = skin as Skin
+		var skel_path: NodePath = node.get("skeleton_path") as NodePath
+		if skel_path and !skel_path.is_empty():
+			mi.skeleton = skel_path
+
+		var parent: Node = node.get_parent()
+		if parent:
+			var idx: int = node.get_index()
+			parent.add_child(mi)
+			parent.move_child(mi, idx)
+
+		node.get_parent().remove_child(node)
+		node.free()
 
 
 ## Scans base_dir (and its sub-folders) for image files and tries to match
@@ -1292,6 +1405,24 @@ func fix_materials(model: Node3D):
 			child.set_surface_override_material(0, override_material)
 			
 func clear_model():
+	# ── Reset animation state BEFORE freeing the model ────────────────────────
+	if current_animation_player and is_instance_valid(current_animation_player):
+		if current_animation_player.animation_finished.is_connected(_on_animation_finished):
+			current_animation_player.animation_finished.disconnect(_on_animation_finished)
+		current_animation_player.stop()
+	current_animation_player = null
+	current_animation        = ""
+	is_playing               = false
+	_timeline_updating       = false
+
+	if play_pause_button:
+		play_pause_button.visible = false
+		play_pause_button.text    = "▶"
+	if timeline_slider:
+		timeline_slider.visible = false
+		timeline_slider.value   = 0.0
+	if _grid_instance:
+		_grid_instance.visible = false
 	if current_model:
 		for child in _get_all_children(current_model):
 			if child is MeshInstance3D:
@@ -1343,15 +1474,11 @@ func _input(event: InputEvent) -> void:
 					auto_rotation_speed = initial_auto_rotation_speed
 				
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and mouse_in_viewport:
-			var model_size = get_model_size()
-			camera_distance = max(model_size * 0.5, camera_distance * 0.9)
-			update_camera_position()
+			_do_zoom(true, event.position)
 			get_viewport().set_input_as_handled()
-			
+
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and mouse_in_viewport:
-			var model_size = get_model_size()
-			camera_distance = min(model_size * 10.0, camera_distance * 1.1)
-			update_camera_position()
+			_do_zoom(false, event.position)
 			get_viewport().set_input_as_handled()
 			
 	elif event is InputEventMouseMotion and is_dragging:
@@ -1383,16 +1510,12 @@ func _unhandled_input(event: InputEvent) -> void:
 					
 			MOUSE_BUTTON_WHEEL_UP:
 				if mouse_in_viewport:
-					var model_size := get_model_size()
-					camera_distance = max(model_size * 0.1, camera_distance / zoom_speed)
-					update_camera_position()
+					_do_zoom(true, event.position)
 					get_viewport().set_input_as_handled()
-					
+
 			MOUSE_BUTTON_WHEEL_DOWN:
 				if mouse_in_viewport:
-					var model_size := get_model_size()
-					camera_distance = min(model_size * 20.0, camera_distance * zoom_speed)
-					update_camera_position()
+					_do_zoom(false, event.position)
 					get_viewport().set_input_as_handled()
 					
 	elif event is InputEventMouseMotion:
@@ -1427,53 +1550,93 @@ func get_model_details() -> Dictionary:
 
 	var details = {
 		"materials_data": [],
-		"textures_data": [],
-		"animations_data": []
+		"textures_data":  [],
+		"animations_data":[],
+		"aabb_size":      Vector3.ZERO,
+		"vertices":       "0",
+		"faces":          "0",
+		"materials":      "0",
 	}
 
+	var _ad := _get_model_aabb(current_model)
+	if bool(_ad["has_mesh"]):
+		details["aabb_size"] = (_ad["aabb"] as AABB).size
+
+	var vertex_count  := 0
+	var face_count    := 0
+	var mat_rid_seen  := {}   # RID → true, to de-duplicate shared materials
+
 	for child in _get_all_children(current_model):
-		if child is MeshInstance3D:
-			var mesh = child.mesh
-			if mesh:
-				for surface_idx in range(mesh.get_surface_count()):
-					var surface_material = mesh.surface_get_material(surface_idx)
-					if surface_material:
-						var mat_info = {
-							"name": surface_material.resource_name if surface_material.resource_name else "Material " + str(surface_idx),
-							"type": surface_material.get_class(),
-							"properties": {}
-						}
+		if not child is MeshInstance3D:
+			continue
+		var mi := child as MeshInstance3D
+		if !mi.mesh:
+			continue
+		var mesh: Mesh = mi.mesh
 
-						if surface_material is StandardMaterial3D:
-							mat_info.properties = {
-								"albedo_color": surface_material.albedo_color,
-								"metallic": surface_material.metallic,
-								"roughness": surface_material.roughness,
-								"emission_enabled": surface_material.emission_enabled,
-								"normal_enabled": surface_material.normal_enabled
-							}
+		for surface_idx in range(mesh.get_surface_count()):
+			# ── geometry counts ──────────────────────────────────────────
+			var arrays: Array = mesh.surface_get_arrays(surface_idx)
+			if arrays and arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array:
+				var verts := arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array
+				vertex_count += verts.size()
+				if arrays[Mesh.ARRAY_INDEX] is PackedInt32Array:
+					var idx_arr := arrays[Mesh.ARRAY_INDEX] as PackedInt32Array
+					face_count += idx_arr.size() / 3
+				else:
+					face_count += verts.size() / 3
 
-							if surface_material.albedo_texture:
-								details.textures_data.append({
-									"name": "Albedo " + mat_info.name,
-									"texture": surface_material.albedo_texture
-								})
+			# ── material info ────────────────────────────────────────────
+			var surface_material: Material = mesh.surface_get_material(surface_idx)
+			if !surface_material:
+				continue
 
-							if surface_material.normal_texture:
-								details.textures_data.append({
-									"name": "Normal " + mat_info.name,
-									"texture": surface_material.normal_texture
-								})
+			# Count unique materials by RID so shared ones aren't doubled.
+			var rid: RID = surface_material.get_rid()
+			if !mat_rid_seen.has(rid):
+				mat_rid_seen[rid] = true
 
-						details.materials_data.append(mat_info)
+			var mat_info := {
+				"name": surface_material.resource_name \
+						if surface_material.resource_name \
+						else "Material " + str(surface_idx),
+				"type":       surface_material.get_class(),
+				"properties": {}
+			}
 
-	var animation_player = _find_animation_player(current_model)
+			if surface_material is StandardMaterial3D:
+				var sm := surface_material as StandardMaterial3D
+				mat_info.properties = {
+					"albedo_color":     sm.albedo_color,
+					"metallic":         sm.metallic,
+					"roughness":        sm.roughness,
+					"emission_enabled": sm.emission_enabled,
+					"normal_enabled":   sm.normal_enabled
+				}
+				if sm.albedo_texture:
+					details.textures_data.append({
+						"name":    "Albedo " + mat_info.name,
+						"texture": sm.albedo_texture
+					})
+				if sm.normal_texture:
+					details.textures_data.append({
+						"name":    "Normal " + mat_info.name,
+						"texture": sm.normal_texture
+					})
+
+			details.materials_data.append(mat_info)
+
+	details["vertices"]  = str(vertex_count)
+	details["faces"]     = str(face_count)
+	details["materials"] = str(mat_rid_seen.size())
+
+	var animation_player := _find_animation_player(current_model)
 	if animation_player:
 		for anim_name in animation_player.get_animation_list():
-			var animation = animation_player.get_animation(anim_name)
+			var animation: Animation = animation_player.get_animation(anim_name)
 			if animation:
 				details.animations_data.append({
-					"name": anim_name,
+					"name":   anim_name,
 					"length": animation.length,
 					"player": animation_player
 				})
@@ -1537,21 +1700,69 @@ func _get_material_info(surface_material: Material) -> Dictionary:
 	return info
 
 func play_animation(animation_name: String, player: AnimationPlayer):
+	if !player or !is_instance_valid(player):
+		return
+	if !player.has_animation(animation_name):
+		push_warning("AnimationPlayer: animation '%s' not found." % animation_name)
+		return
+
+	# Disconnect previous player's signal to avoid ghost callbacks
+	if current_animation_player \
+			and is_instance_valid(current_animation_player) \
+			and current_animation_player.animation_finished.is_connected(_on_animation_finished):
+		current_animation_player.animation_finished.disconnect(_on_animation_finished)
+
 	current_animation_player = player
-	current_animation = animation_name
-	
+	current_animation        = animation_name
+	animation_speed_scale    = 1.0
+	player.speed_scale       = 1.0
+
+	# Connect animation_finished so the button resets when clip ends
+	if not player.animation_finished.is_connected(_on_animation_finished):
+		player.animation_finished.connect(_on_animation_finished)
+
+	var anim: Animation = player.get_animation(animation_name)
+	var anim_len: float  = anim.length if anim else 1.0
+
 	if play_pause_button:
 		play_pause_button.visible = true
+	if _speed_option_btn:
+		_speed_option_btn.visible = true
+		_speed_option_btn.selected = 2  # ×1
 	if timeline_slider:
-		timeline_slider.visible = true
-		timeline_slider.min_value = 0
-		timeline_slider.max_value = player.get_animation(animation_name).length
-		timeline_slider.value = 0
-	
+		_timeline_updating        = true
+		timeline_slider.visible   = true
+		timeline_slider.min_value = 0.0
+		timeline_slider.max_value = anim_len
+		timeline_slider.step      = 0.01   # smooth sub-second movement
+		timeline_slider.value     = 0.0
+		_timeline_updating        = false
+
 	_play_animation()
 
+
+func _on_animation_finished(anim_name: String) -> void:
+	# Called when a non-looping animation reaches its end.
+	# For looping animations this fires at each loop boundary — ignore it.
+	if !current_animation_player or !is_instance_valid(current_animation_player):
+		return
+	var anim: Animation = current_animation_player.get_animation(anim_name) \
+			if current_animation_player.has_animation(anim_name) else null
+	if anim and anim.loop_mode != Animation.LOOP_NONE:
+		return   # looping — don't reset state
+	is_playing = false
+	if play_pause_button:
+		play_pause_button.text = "▶"
+	if timeline_slider:
+		_timeline_updating    = true
+		timeline_slider.value = 0.0
+		_timeline_updating    = false
+
+
 func _play_animation():
-	if current_animation_player and current_animation:
+	if current_animation_player \
+			and is_instance_valid(current_animation_player) \
+			and current_animation:
 		current_animation_player.play(current_animation)
 		is_playing = true
 		if play_pause_button:
@@ -1703,26 +1914,33 @@ func setup_environment() -> void:
 	environment.tonemap_exposure = 1.0
 	environment.tonemap_white = 1.0
 	
-	var world_environment = WorldEnvironment.new()
-	world_environment.environment = environment
-	preview_viewport.add_child(world_environment)
+	_world_env_node = WorldEnvironment.new()
+	_world_env_node.environment = environment
+	preview_viewport.add_child(_world_env_node)
+
+	_main_light = DirectionalLight3D.new()
+	_main_light.rotation_degrees = Vector3(_light_elevation_deg, _light_azimuth_deg, 0.0)
+	_main_light.light_energy     = _light_energy
+	_main_light.light_color      = Color(1.0, 0.98, 0.95)
+	_main_light.shadow_enabled   = true
+	_main_light.shadow_bias      = 0.01
+	_main_light.shadow_normal_bias = 1.0
+	_main_light.shadow_blur      = 1.0
+	preview_viewport.add_child(_main_light)
 	
-	var main_light = DirectionalLight3D.new()
-	main_light.rotation_degrees = Vector3(-60, -30, 0)
-	main_light.light_energy = 2.0
-	main_light.light_color = Color(1.0, 0.98, 0.95)
-	main_light.shadow_enabled = true
-	main_light.shadow_bias = 0.01
-	main_light.shadow_normal_bias = 1.0
-	main_light.shadow_blur = 1.0
-	preview_viewport.add_child(main_light)
-	
-	var fill_light = DirectionalLight3D.new()
-	fill_light.rotation_degrees = Vector3(-30, 150, 0)
-	fill_light.light_energy = 1.0
-	fill_light.light_color = Color(0.95, 0.95, 1.0)
-	fill_light.shadow_enabled = false
-	preview_viewport.add_child(fill_light)
+	_fill_light = DirectionalLight3D.new()
+	_fill_light.rotation_degrees = Vector3(-30, 150, 0)
+	_fill_light.light_energy = 1.0
+	_fill_light.light_color = Color(0.95, 0.95, 1.0)
+	_fill_light.shadow_enabled = false
+	preview_viewport.add_child(_fill_light)
+
+	_rim_light = DirectionalLight3D.new()
+	_rim_light.rotation_degrees = Vector3(-15, -135, 0)
+	_rim_light.light_energy = 0.4
+	_rim_light.light_color = Color(1.0, 1.0, 1.0)
+	_rim_light.shadow_enabled = false
+	preview_viewport.add_child(_rim_light)
 
 func setup_viewport() -> void:
 	if !preview_viewport:
@@ -1803,10 +2021,522 @@ func setup_light() -> void:
 	main_light.shadow_bias = 0.02
 	main_light.shadow_blur = 0.0
 	preview_viewport.add_child(main_light)
-	
+
 	var fill_light = DirectionalLight3D.new()
 	fill_light.rotation_degrees = Vector3(-30, 135, 0)
 	fill_light.light_energy = 0.5
 	fill_light.light_color = Color(1.0, 1.0, 1.0)
 	fill_light.shadow_enabled = false
 	preview_viewport.add_child(fill_light)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Camera presets & reset
+# ══════════════════════════════════════════════════════════════════════════════
+func reset_camera() -> void:
+	if !current_model:
+		return
+	var aabb_info := _get_model_aabb(current_model)
+	if bool(aabb_info["has_mesh"]):
+		var extent := _get_aabb_max_axis(aabb_info["aabb"])
+		camera_horizontal_angle = 0.0
+		camera_vertical_angle   = PI / 4.0
+		camera_distance         = max(extent * 2.0, 2.0)
+		orbit_center            = Vector3.ZERO
+		update_camera_position()
+
+
+## Fit model into view keeping current angle — only adjusts distance & orbit center.
+func fit_to_view() -> void:
+	if !current_model:
+		return
+	var aabb_info := _get_model_aabb(current_model)
+	if bool(aabb_info["has_mesh"]):
+		var total_aabb: AABB = aabb_info["aabb"]
+		orbit_center    = total_aabb.get_center()
+		var extent: float = _get_aabb_max_axis(total_aabb)
+		camera_distance = maxf(extent * 2.0, 0.5)
+		update_camera_position()
+
+
+## Capture the current viewport as a thumbnail of the given pixel size.
+func capture_thumbnail(size: Vector2i) -> ImageTexture:
+	if !preview_viewport:
+		return null
+	var img: Image = preview_viewport.get_texture().get_image()
+	if !img or img.is_empty():
+		return null
+	img.resize(size.x, size.y, Image.INTERPOLATE_BILINEAR)
+	return ImageTexture.create_from_image(img)
+
+
+## Return the raw viewport image at its current resolution (for saving to disk).
+func get_screenshot_image() -> Image:
+	if !preview_viewport:
+		return null
+	return preview_viewport.get_texture().get_image()
+
+
+func set_view_preset(preset: int) -> void:
+	if !current_model:
+		return
+	is_rotating         = false
+	auto_rotation_speed = 0.0
+	match preset:
+		ViewPreset.FRONT:
+			camera_horizontal_angle = 0.0
+			camera_vertical_angle   = PI / 2.0
+		ViewPreset.BACK:
+			camera_horizontal_angle = PI
+			camera_vertical_angle   = PI / 2.0
+		ViewPreset.RIGHT:
+			camera_horizontal_angle = PI / 2.0
+			camera_vertical_angle   = PI / 2.0
+		ViewPreset.LEFT:
+			camera_horizontal_angle = -PI / 2.0
+			camera_vertical_angle   = PI / 2.0
+		ViewPreset.TOP:
+			camera_horizontal_angle = 0.0
+			camera_vertical_angle   = 0.01
+		ViewPreset.BOTTOM:
+			camera_horizontal_angle = 0.0
+			camera_vertical_angle   = PI - 0.01
+	update_camera_position()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Grid floor
+# ══════════════════════════════════════════════════════════════════════════════
+func toggle_grid() -> void:
+	grid_visible = !grid_visible
+	if _grid_instance:
+		_grid_instance.visible = grid_visible
+
+
+func _update_grid() -> void:
+	if _grid_instance:
+		_grid_instance.queue_free()
+		_grid_instance = null
+
+	if !current_model or !preview_viewport:
+		return
+
+	var aabb_info := _get_model_aabb(current_model)
+	var grid_y    := 0.0
+	var cell_size := 1.0
+	var half_cells := 10
+
+	if bool(aabb_info["has_mesh"]):
+		var total_aabb: AABB = aabb_info["aabb"]
+		grid_y = total_aabb.position.y
+		var half_span: float = maxf(_get_aabb_max_axis(total_aabb) * 1.5, 5.0)
+		# Pick a "nice" cell size so we get ≤ 15 cells per half-axis.
+		var _steps: Array[float] = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0]
+		for candidate: float in _steps:
+			if half_span / candidate <= 15.0:
+				cell_size = candidate
+				break
+		half_cells = clampi(int(ceil(half_span / cell_size)), 5, 20)
+
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_color = Color(0.55, 0.55, 0.55, 0.45)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+
+	var half_span_w := half_cells * cell_size
+	var mesh := ImmediateMesh.new()
+	mesh.surface_begin(Mesh.PRIMITIVE_LINES, mat)
+	for i: int in range(-half_cells, half_cells + 1):
+		var p := i * cell_size
+		mesh.surface_add_vertex(Vector3(p,           grid_y, -half_span_w))
+		mesh.surface_add_vertex(Vector3(p,           grid_y,  half_span_w))
+		mesh.surface_add_vertex(Vector3(-half_span_w, grid_y,  p))
+		mesh.surface_add_vertex(Vector3( half_span_w, grid_y,  p))
+	mesh.surface_end()
+
+	_grid_instance         = MeshInstance3D.new()
+	_grid_instance.mesh    = mesh
+	_grid_instance.visible = grid_visible
+	preview_viewport.add_child(_grid_instance)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  XYZ axis gizmo overlay
+# ══════════════════════════════════════════════════════════════════════════════
+func toggle_gizmo() -> void:
+	gizmo_visible = !gizmo_visible
+	if _gizmo_overlay:
+		_gizmo_overlay.visible = gizmo_visible
+
+
+func _create_gizmo_overlay() -> void:
+	_gizmo_overlay             = Control.new()
+	_gizmo_overlay.name        = "GizmoOverlay"
+	_gizmo_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_gizmo_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_gizmo_overlay.draw.connect(_on_gizmo_draw)
+	add_child(_gizmo_overlay)
+
+
+func _on_gizmo_draw() -> void:
+	if !preview_camera or !current_model or !_gizmo_overlay:
+		return
+
+	var arm    := 36.0
+	var pad    := 14.0
+	var ov     := _gizmo_overlay
+	var origin := Vector2(pad + arm, ov.size.y - pad - arm)
+	var basis: Basis = preview_camera.global_transform.basis
+	var font   := ThemeDB.fallback_font
+
+	# Project world axes: screen_right = cam.basis.x, screen_up = cam.basis.y (negated for screen Y)
+	var axes: Array = [
+		[Vector2(basis.x.x, -basis.y.x), Color(0.90, 0.22, 0.22), "X", basis.z.x],
+		[Vector2(basis.x.y, -basis.y.y), Color(0.22, 0.78, 0.22), "Y", basis.z.y],
+		[Vector2(basis.x.z, -basis.y.z), Color(0.28, 0.52, 1.00), "Z", basis.z.z],
+	]
+	# Painter's sort: draw axes pointing away from camera first
+	axes.sort_custom(func(a: Array, b: Array) -> bool: return a[3] > b[3])
+
+	for ax: Array in axes:
+		var end := origin + (ax[0] as Vector2) * arm
+		ov.draw_line(origin, end, ax[1], 2.0)
+		ov.draw_circle(end, 4.0, ax[1])
+		ov.draw_string(font, end + Vector2(7, 4), ax[2],
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, ax[1])
+
+	ov.draw_circle(origin, 3.5, Color(0.85, 0.85, 0.85, 0.9))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Wireframe
+# ══════════════════════════════════════════════════════════════════════════════
+func toggle_wireframe() -> void:
+	wireframe_enabled = !wireframe_enabled
+	if preview_viewport:
+		preview_viewport.debug_draw = \
+			Viewport.DEBUG_DRAW_WIREFRAME if wireframe_enabled \
+			else Viewport.DEBUG_DRAW_DISABLED
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Zoom to cursor
+# ══════════════════════════════════════════════════════════════════════════════
+func toggle_zoom_to_cursor() -> void:
+	zoom_to_cursor = !zoom_to_cursor
+
+
+func _do_zoom(zoom_in: bool, mouse_pos: Vector2) -> void:
+	var model_size := get_model_size()
+	var old_dist   := camera_distance
+
+	if zoom_in:
+		camera_distance = max(model_size * 0.1, camera_distance / zoom_speed)
+	else:
+		camera_distance = min(model_size * 20.0, camera_distance * zoom_speed)
+
+	if zoom_to_cursor and preview_camera:
+		var dist_change := camera_distance - old_dist
+		var ray_dir: Vector3 = preview_camera.project_ray_normal(mouse_pos)
+		orbit_center    -= ray_dir * dist_change * 0.45
+
+	update_camera_position()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Screenshot
+# ══════════════════════════════════════════════════════════════════════════════
+func take_screenshot() -> Image:
+	if !preview_viewport:
+		return null
+	return preview_viewport.get_texture().get_image()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Animation speed control
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_speed_control() -> void:
+	var controls_row := get_node_or_null("../HSplitContainer_ControlsRow")
+	if !controls_row:
+		return
+
+	_speed_option_btn = OptionButton.new()
+	_speed_option_btn.add_item("×0.25", 0)
+	_speed_option_btn.add_item("×0.5",  1)
+	_speed_option_btn.add_item("×1",    2)
+	_speed_option_btn.add_item("×2",    3)
+	_speed_option_btn.add_item("×4",    4)
+	_speed_option_btn.selected          = 2
+	_speed_option_btn.custom_minimum_size.x = 68
+	_speed_option_btn.tooltip_text      = "Скорость анимации"
+	_speed_option_btn.visible           = false
+	_speed_option_btn.item_selected.connect(func(idx: int) -> void:
+		const SPEEDS: Array = [0.25, 0.5, 1.0, 2.0, 4.0]
+		animation_speed_scale = SPEEDS[idx]
+		if current_animation_player:
+			current_animation_player.speed_scale = animation_speed_scale
+	)
+	controls_row.add_child(_speed_option_btn)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Environment presets & HDRI
+# ══════════════════════════════════════════════════════════════════════════════
+func set_env_preset(preset: int) -> void:
+	if !_world_env_node or !_world_env_node.environment:
+		return
+	var env: Environment = _world_env_node.environment
+	match preset:
+		0:  # Default gray
+			env.background_mode        = Environment.BG_COLOR
+			env.background_color       = Color(0.2, 0.2, 0.2)
+			env.ambient_light_source   = Environment.AMBIENT_SOURCE_COLOR
+			env.ambient_light_color    = Color(0.4, 0.4, 0.4)
+			env.ambient_light_energy   = 1.5
+			env.sky = null
+		1:  # Dark studio
+			env.background_mode        = Environment.BG_COLOR
+			env.background_color       = Color(0.05, 0.05, 0.05)
+			env.ambient_light_source   = Environment.AMBIENT_SOURCE_COLOR
+			env.ambient_light_color    = Color(0.1, 0.1, 0.1)
+			env.ambient_light_energy   = 0.5
+			env.sky = null
+		2:  # White
+			env.background_mode        = Environment.BG_COLOR
+			env.background_color       = Color(0.92, 0.92, 0.92)
+			env.ambient_light_source   = Environment.AMBIENT_SOURCE_COLOR
+			env.ambient_light_color    = Color(0.85, 0.85, 0.85)
+			env.ambient_light_energy   = 2.0
+			env.sky = null
+		3:  # Procedural sky
+			var sky_mat := ProceduralSkyMaterial.new()
+			var sky     := Sky.new()
+			sky.sky_material           = sky_mat
+			env.sky                    = sky
+			env.background_mode        = Environment.BG_SKY
+			env.ambient_light_source   = Environment.AMBIENT_SOURCE_SKY
+			env.ambient_light_energy   = 1.0
+
+
+func load_env_hdri(path: String) -> void:
+	if !_world_env_node or !_world_env_node.environment:
+		return
+	var img := Image.load_from_file(path)
+	if !img:
+		push_error("load_env_hdri: failed to load " + path)
+		return
+	var panorama_mat := PanoramaSkyMaterial.new()
+	panorama_mat.panorama = ImageTexture.create_from_image(img)
+	var sky := Sky.new()
+	sky.sky_material = panorama_mat
+	var env: Environment = _world_env_node.environment
+	env.sky                  = sky
+	env.background_mode      = Environment.BG_SKY
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+	env.ambient_light_energy = 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Light control
+# ══════════════════════════════════════════════════════════════════════════════
+func _apply_light_transform() -> void:
+	if _main_light:
+		_main_light.rotation_degrees = Vector3(_light_elevation_deg, _light_azimuth_deg, 0.0)
+
+
+func set_light_azimuth(deg: float) -> void:
+	_light_azimuth_deg = deg
+	_apply_light_transform()
+
+
+func set_light_elevation(deg: float) -> void:
+	_light_elevation_deg = deg
+	_apply_light_transform()
+
+
+func set_light_energy(energy: float) -> void:
+	_light_energy = energy
+	if _main_light:
+		_main_light.light_energy = energy
+
+
+func set_light_color(color: Color) -> void:
+	if _main_light:
+		_main_light.light_color = color
+
+
+func set_shadow_enabled(on: bool) -> void:
+	if _main_light:
+		_main_light.shadow_enabled = on
+
+
+func set_fill_light_energy(energy: float) -> void:
+	if _fill_light:
+		_fill_light.light_energy = energy
+
+
+func set_fill_light_enabled(on: bool) -> void:
+	if _fill_light:
+		_fill_light.visible = on
+
+
+func set_rim_light_energy(energy: float) -> void:
+	if _rim_light:
+		_rim_light.light_energy = energy
+
+
+func set_rim_light_enabled(on: bool) -> void:
+	if _rim_light:
+		_rim_light.visible = on
+
+
+func set_ambient_energy(energy: float) -> void:
+	if _world_env_node and _world_env_node.environment:
+		_world_env_node.environment.ambient_light_energy = energy
+
+
+## preset: 0 = Studio (3-point), 1 = Outdoor, 2 = Night, 3 = Rimlight
+func apply_light_preset(preset: int) -> void:
+	match preset:
+		0:  # Studio — warm key, cool fill, white rim
+			_light_azimuth_deg   = -30.0
+			_light_elevation_deg = -55.0
+			_light_energy        = 2.0
+			if _main_light:
+				_main_light.light_energy = _light_energy
+				_main_light.light_color  = Color(1.0, 0.98, 0.95)
+				_main_light.shadow_enabled = true
+			if _fill_light:
+				_fill_light.light_energy = 1.0
+				_fill_light.light_color  = Color(0.88, 0.92, 1.0)
+				_fill_light.visible      = true
+			if _rim_light:
+				_rim_light.light_energy = 0.6
+				_rim_light.light_color  = Color(1.0, 1.0, 1.0)
+				_rim_light.visible      = true
+			set_ambient_energy(1.0)
+		1:  # Outdoor — bright sun, sky fill, no rim
+			_light_azimuth_deg   = 45.0
+			_light_elevation_deg = -50.0
+			_light_energy        = 3.0
+			if _main_light:
+				_main_light.light_energy = _light_energy
+				_main_light.light_color  = Color(1.0, 0.97, 0.88)
+				_main_light.shadow_enabled = true
+			if _fill_light:
+				_fill_light.light_energy = 0.5
+				_fill_light.light_color  = Color(0.7, 0.85, 1.0)
+				_fill_light.visible      = true
+			if _rim_light:
+				_rim_light.light_energy = 0.0
+				_rim_light.visible      = false
+			set_ambient_energy(1.4)
+		2:  # Night — dim blue-toned key, no fill, strong rim
+			_light_azimuth_deg   = -60.0
+			_light_elevation_deg = -20.0
+			_light_energy        = 0.4
+			if _main_light:
+				_main_light.light_energy = _light_energy
+				_main_light.light_color  = Color(0.7, 0.78, 1.0)
+				_main_light.shadow_enabled = true
+			if _fill_light:
+				_fill_light.light_energy = 0.0
+				_fill_light.visible      = false
+			if _rim_light:
+				_rim_light.light_energy = 0.8
+				_rim_light.light_color  = Color(0.5, 0.65, 1.0)
+				_rim_light.visible      = true
+			set_ambient_energy(0.3)
+		3:  # Rimlight only
+			_light_elevation_deg = -30.0
+			_light_energy        = 0.2
+			if _main_light:
+				_main_light.light_energy = _light_energy
+				_main_light.shadow_enabled = false
+			if _fill_light:
+				_fill_light.light_energy = 0.0
+				_fill_light.visible      = false
+			if _rim_light:
+				_rim_light.light_energy = 2.0
+				_rim_light.light_color  = Color(1.0, 1.0, 1.0)
+				_rim_light.visible      = true
+			set_ambient_energy(0.5)
+	_apply_light_transform()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FPS / stats overlay
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_fps_overlay() -> void:
+	_fps_label = Label.new()
+	_fps_label.name    = "FPSOverlayLabel"
+	_fps_label.visible = false
+	_fps_label.set_anchors_and_offsets_preset(Control.PRESET_TOP_RIGHT)
+	_fps_label.offset_left  = -160
+	_fps_label.offset_right = -8
+	_fps_label.offset_top   = 8
+	_fps_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_fps_label.add_theme_font_size_override("font_size", 13)
+	_fps_label.add_theme_color_override("font_color",        Color(1.0, 0.95, 0.2))
+	_fps_label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.85))
+	_fps_label.add_theme_constant_override("shadow_offset_x", 1)
+	_fps_label.add_theme_constant_override("shadow_offset_y", 1)
+	add_child(_fps_label)
+
+
+func toggle_fps_counter() -> bool:
+	_fps_visible = !_fps_visible
+	if _fps_label:
+		_fps_label.visible = _fps_visible
+	return _fps_visible
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Texture channel debug view
+# ══════════════════════════════════════════════════════════════════════════════
+func set_texture_channel(ch: int) -> void:
+	_tex_channel = ch
+	if !current_model:
+		return
+	for node in _get_all_children(current_model):
+		if not node is MeshInstance3D:
+			continue
+		var mi := node as MeshInstance3D
+		if !mi.mesh:
+			continue
+		for i: int in range(mi.mesh.get_surface_count()):
+			if ch == 0:
+				mi.set_surface_override_material(i, null)   # restore original
+			else:
+				var orig: Material = mi.mesh.surface_get_material(i)
+				mi.set_surface_override_material(i, _make_channel_material(orig, ch))
+
+
+func _make_channel_material(orig: Material, ch: int) -> StandardMaterial3D:
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+	if not orig is StandardMaterial3D:
+		mat.albedo_color = Color(0.5, 0.5, 0.5)
+		return mat
+	var sm := orig as StandardMaterial3D
+	match ch:
+		1:  # Albedo — show with lighting for correct colour read
+			mat.shading_mode   = BaseMaterial3D.SHADING_MODE_PER_PIXEL
+			mat.albedo_color   = sm.albedo_color
+			mat.albedo_texture = sm.albedo_texture
+		2:  # Roughness → grayscale
+			mat.albedo_color   = Color(sm.roughness, sm.roughness, sm.roughness)
+			if sm.roughness_texture:
+				mat.albedo_texture = sm.roughness_texture
+		3:  # Normal map → shown as colour
+			if sm.normal_texture:
+				mat.albedo_texture = sm.normal_texture
+			else:
+				mat.albedo_color   = Color(0.5, 0.5, 1.0)
+		4:  # Metallic → grayscale
+			mat.albedo_color   = Color(sm.metallic, sm.metallic, sm.metallic)
+			if sm.metallic_texture:
+				mat.albedo_texture = sm.metallic_texture
+	return mat

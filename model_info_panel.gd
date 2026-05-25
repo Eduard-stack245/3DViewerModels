@@ -10,6 +10,8 @@ var faces_label: Label = null
 var materials_label: Label = null
 var path_label: Label = null
 
+var dimensions_label: Label = null
+
 var materials_container: VBoxContainer = null
 var textures_container: VBoxContainer = null
 var animations_container: VBoxContainer = null
@@ -31,6 +33,7 @@ func _ready() -> void:
 		push_error("Material/texture/animation containers not found!")
 		return
 
+	_create_dimensions_label()
 	setup_ui()
 	clear_info()
 
@@ -56,9 +59,11 @@ func _ensure_responsive_scroll_layout() -> void:
 	existing_scroll = get_node_or_null("ScrollContainer") as ScrollContainer
 	if existing_scroll:
 		existing_scroll.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-		existing_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		existing_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-		existing_scroll.clip_contents = true
+		existing_scroll.size_flags_horizontal        = Control.SIZE_EXPAND_FILL
+		existing_scroll.size_flags_vertical          = Control.SIZE_EXPAND_FILL
+		existing_scroll.clip_contents                = true
+		# Disable horizontal scroll — forces all content to wrap within panel width
+		existing_scroll.horizontal_scroll_mode       = ScrollContainer.SCROLL_MODE_DISABLED
 
 	content_root = get_node_or_null("ScrollContainer/VBoxContainer") as VBoxContainer
 	if !content_root:
@@ -91,26 +96,26 @@ func setup_ui() -> void:
 	if content_root:
 		content_root.custom_minimum_size = Vector2(0, 0)
 		content_root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		content_root.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		content_root.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 
-	_setup_wrapping_label(file_name_label)
-	_setup_wrapping_label(path_label)
+	# Apply wrapping + clipping to every info label so long paths/names
+	# never overflow the right panel.
+	for lbl in [file_name_label, type_label, size_label, date_modified_label,
+				vertices_label, faces_label, materials_label, dimensions_label,
+				path_label]:
+		_setup_wrapping_label(lbl)
 
-	if materials_container:
-		materials_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		materials_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	if textures_container:
-		textures_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		textures_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	if animations_container:
-		animations_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		animations_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	for container in [materials_container, textures_container, animations_container]:
+		if container:
+			container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			container.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 
 func _setup_wrapping_label(label: Label) -> void:
 	if !label:
 		return
-	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	label.clip_text = true
+	label.autowrap_mode        = TextServer.AUTOWRAP_WORD_SMART
+	label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	label.clip_text            = false   # let it wrap, not clip mid-character
 
 
 func update_info(model_info: Dictionary) -> void:
@@ -126,6 +131,13 @@ func update_info(model_info: Dictionary) -> void:
 	faces_label.text = "Граней: " + str(model_info.get("faces", "Неизвестно"))
 	materials_label.text = "Материалов: " + str(model_info.get("materials", "Неизвестно"))
 	path_label.text = "Путь: " + str(model_info.get("path", "Неизвестно"))
+
+	var aabb_sz: Vector3 = model_info.get("aabb_size", Vector3.ZERO)
+	if dimensions_label:
+		if aabb_sz != Vector3.ZERO:
+			dimensions_label.text = "Размеры: %.2f × %.2f × %.2f" % [aabb_sz.x, aabb_sz.y, aabb_sz.z]
+		else:
+			dimensions_label.text = "Размеры: -"
 
 	update_materials_list(model_info.get("materials_data", []))
 	update_textures_list(model_info.get("textures_data", []))
@@ -213,26 +225,44 @@ func _close_material_preview() -> void:
 
 
 func _on_texture_pressed(texture_info: Dictionary) -> void:
+	var tex: Texture2D = texture_info.get("texture", null) as Texture2D
+
+	# Pick an initial window size that fits the texture but caps at 80% of screen.
+	var screen_size: Vector2 = DisplayServer.screen_get_size()
+	var max_w := screen_size.x * 0.8
+	var max_h := screen_size.y * 0.8
+	var win_w  := 512.0
+	var win_h  := 512.0
+	if tex:
+		var tw := float(tex.get_width())
+		var th := float(tex.get_height())
+		var scale := minf(max_w / tw, max_h / th)
+		if scale < 1.0:
+			win_w = tw * scale
+			win_h = th * scale
+		else:
+			win_w = tw
+			win_h = th
+	win_w = maxf(win_w, 200.0)
+	win_h = maxf(win_h, 200.0)
+
 	var preview_window := Window.new()
-	preview_window.title = "Texture Preview: " + str(texture_info.get("name", "Unknown"))
-	preview_window.size = Vector2(440, 440)
+	preview_window.title    = str(texture_info.get("name", "Текстура"))
+	preview_window.size     = Vector2(win_w, win_h)
+	preview_window.min_size = Vector2i(200, 200)
 	preview_window.close_requested.connect(func(): preview_window.queue_free())
 
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", 10)
-	vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT, Control.PRESET_MODE_MINSIZE, 10)
-
+	# TextureRect fills the entire window and rescales when the window is resized.
 	var texture_rect := TextureRect.new()
-	if texture_info.has("texture"):
-		texture_rect.texture = texture_info["texture"]
-	texture_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	texture_rect.custom_minimum_size = Vector2(360, 340)
-	texture_rect.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	texture_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	texture_rect.stretch_mode  = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	texture_rect.expand_mode   = TextureRect.EXPAND_IGNORE_SIZE
+	texture_rect.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	texture_rect.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	if tex:
+		texture_rect.texture = tex
 
-	vbox.add_child(texture_rect)
-	vbox.add_child(_create_close_button(preview_window))
-
-	preview_window.add_child(vbox)
+	preview_window.add_child(texture_rect)
 	add_child(preview_window)
 	preview_window.popup_centered()
 
@@ -293,6 +323,8 @@ func clear_info() -> void:
 		faces_label.text = "Граней: -"
 	if materials_label:
 		materials_label.text = "Материалов: -"
+	if dimensions_label:
+		dimensions_label.text = "Размеры: -"
 	if path_label:
 		path_label.text = "Путь: -"
 
@@ -320,6 +352,18 @@ func _add_empty_label(container: Container, text: String) -> void:
 	label.text = text
 	label.modulate.a = 0.65
 	container.add_child(label)
+
+
+func _create_dimensions_label() -> void:
+	if !content_root:
+		return
+	dimensions_label      = Label.new()
+	dimensions_label.name = "DimensionsLabel"
+	dimensions_label.text = "Размеры: -"
+	content_root.add_child(dimensions_label)
+	# Place right after MaterialsLabel
+	if materials_label and materials_label.get_parent() == content_root:
+		content_root.move_child(dimensions_label, materials_label.get_index() + 1)
 
 
 func _create_close_button(window_ref: Window) -> Button:

@@ -1,10 +1,10 @@
-[gd_scene format=3 uid="uid://cj17mi4hgee02"]
+[gd_scene load_steps=4 format=3 uid="uid://cj17mi4hgee02"]
 
-[ext_resource type="Script" path="res://main.gd" id="1_hjdc6"]
-[ext_resource type="Script" path="res://view_model.gd" id="2_wd474"]
-[ext_resource type="Script" path="res://model_info_panel.gd" id="3_kvk5f"]
+[ext_resource type="Script" uid="uid://bq2k6dn52gnnj" path="res://main.gd" id="1_hjdc6"]
+[ext_resource type="Script" uid="uid://dkk7nevqkoxik" path="res://view_model.gd" id="2_wd474"]
+[ext_resource type="Script" uid="uid://d20r243m8xg77" path="res://model_info_panel.gd" id="3_kvk5f"]
 
-[node name="Control" type="Control" unique_id=1702180001]
+[node name="Control" type="Control"]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
@@ -15,7 +15,7 @@ size_flags_horizontal = 3
 size_flags_vertical = 3
 script = ExtResource("1_hjdc6")
 
-[node name="HSplitContainer" type="HSplitContainer" parent="." unique_id=1283775202]
+[node name="HSplitContainer" type="HSplitContainer" parent="."]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -24,46 +24,46 @@ grow_horizontal = 2
 grow_vertical = 2
 metadata/_edit_use_anchors_ = true
 
-[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer" unique_id=75686498]
+[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer"]
 custom_minimum_size = Vector2(145, 0)
 layout_mode = 2
 size_flags_vertical = 3
 
-[node name="SearchLineEdit" type="LineEdit" parent="HSplitContainer/VBoxContainer" unique_id=2049315748]
+[node name="SearchLineEdit" type="LineEdit" parent="HSplitContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 placeholder_text = "Поиск"
 
-[node name="ModelContainer" type="HBoxContainer" parent="HSplitContainer/VBoxContainer" unique_id=759226469]
+[node name="ModelContainer" type="HBoxContainer" parent="HSplitContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="ModelList" type="ItemList" parent="HSplitContainer/VBoxContainer/ModelContainer" unique_id=179536839]
+[node name="ModelList" type="ItemList" parent="HSplitContainer/VBoxContainer/ModelContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="ButtonContainer" type="HBoxContainer" parent="HSplitContainer/VBoxContainer" unique_id=650614972]
+[node name="ButtonContainer" type="HBoxContainer" parent="HSplitContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="SelectProjectButton" type="Button" parent="HSplitContainer/VBoxContainer/ButtonContainer" unique_id=1571609223]
+[node name="SelectProjectButton" type="Button" parent="HSplitContainer/VBoxContainer/ButtonContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 text = "SelectProject"
 
-[node name="HBoxContainer2" type="HSplitContainer" parent="HSplitContainer" unique_id=1360515980]
+[node name="HBoxContainer2" type="HSplitContainer" parent="HSplitContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="VBoxContainer2" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2" unique_id=463036926]
+[node name="VBoxContainer2" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="SubViewportContainer" type="SubViewportContainer" parent="HSplitContainer/HBoxContainer2/VBoxContainer2" unique_id=341772852]
+[node name="SubViewportContainer" type="SubViewportContainer" parent="HSplitContainer/HBoxContainer2/VBoxContainer2"]
 custom_minimum_size = Vector2(120, 80)
 layout_mode = 2
 size_flags_horizontal = 3
@@ -71,43 +71,43 @@ size_flags_vertical = 3
 stretch = true
 script = ExtResource("2_wd474")
 
-[node name="SubViewport" type="SubViewport" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer" unique_id=1528223877]
+[node name="SubViewport" type="SubViewport" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer"]
 unique_name_in_owner = true
 handle_input_locally = false
-size = Vector2i(640, 480)
+size = Vector2i(491, 613)
 render_target_update_mode = 4
 
-[node name="Camera3D" type="Camera3D" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer/SubViewport" unique_id=1611449777]
+[node name="Camera3D" type="Camera3D" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer/SubViewport"]
 unique_name_in_owner = true
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer/SubViewport" unique_id=1764043715]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/SubViewportContainer/SubViewport"]
 
-[node name="HSplitContainer_ControlsRow" type="HBoxContainer" parent="HSplitContainer/HBoxContainer2/VBoxContainer2" unique_id=1212132278]
+[node name="HSplitContainer_ControlsRow" type="HBoxContainer" parent="HSplitContainer/HBoxContainer2/VBoxContainer2"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="PlayPauseButton" type="Button" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/HSplitContainer_ControlsRow" unique_id=779956288]
+[node name="PlayPauseButton" type="Button" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/HSplitContainer_ControlsRow"]
 custom_minimum_size = Vector2(30, 30)
 layout_mode = 2
 text = "▶"
 
-[node name="HSplitContainer_TimelineSlider" type="HSlider" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/HSplitContainer_ControlsRow" unique_id=2055530924]
+[node name="HSplitContainer_TimelineSlider" type="HSlider" parent="HSplitContainer/HBoxContainer2/VBoxContainer2/HSplitContainer_ControlsRow"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="HBoxContainer" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2" unique_id=485981677]
+[node name="HBoxContainer" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="ModelInfoPanel" type="Panel" parent="HSplitContainer/HBoxContainer2/HBoxContainer" unique_id=1440151520]
+[node name="ModelInfoPanel" type="Panel" parent="HSplitContainer/HBoxContainer2/HBoxContainer"]
 custom_minimum_size = Vector2(160, 0)
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 script = ExtResource("3_kvk5f")
 
-[node name="ScrollContainer" type="ScrollContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel" unique_id=1950234711]
+[node name="ScrollContainer" type="ScrollContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel"]
 layout_mode = 1
 anchors_preset = 15
 anchor_right = 1.0
@@ -118,92 +118,92 @@ size_flags_horizontal = 3
 size_flags_vertical = 3
 horizontal_scroll_mode = 0
 
-[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer" unique_id=2003615330]
+[node name="VBoxContainer" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 theme_override_constants/separation = 6
 
-[node name="TitleLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=516860105]
+[node name="TitleLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Информация"
 horizontal_alignment = 1
 
-[node name="HSeparator" type="HSeparator" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1676512779]
+[node name="HSeparator" type="HSeparator" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 
-[node name="FileNameLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=14584041]
+[node name="FileNameLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Файл: "
 autowrap_mode = 3
 
-[node name="TypeLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1295674433]
+[node name="TypeLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Тип: "
 
-[node name="SizeLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1746326478]
+[node name="SizeLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Размер: "
 
-[node name="DateModifiedLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1566157244]
+[node name="DateModifiedLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Изменен: "
 
-[node name="VerticesLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=198802660]
+[node name="VerticesLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Вершин: "
 
-[node name="FacesLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=967518144]
+[node name="FacesLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Граней: "
 
-[node name="MaterialsLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=217409133]
+[node name="MaterialsLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Материалов: "
 
-[node name="PathLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=655245507]
+[node name="PathLabel" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 text = "Путь: "
 autowrap_mode = 3
 
-[node name="HSeparator2" type="HSeparator" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1379419014]
+[node name="HSeparator2" type="HSeparator" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 
-[node name="MaterialsSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=130541679]
+[node name="MaterialsSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="MaterialsHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/MaterialsSection" unique_id=467191435]
+[node name="MaterialsHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/MaterialsSection"]
 layout_mode = 2
 text = "Материалы:"
 
-[node name="MaterialsList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/MaterialsSection" unique_id=352412200]
+[node name="MaterialsList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/MaterialsSection"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="TexturesSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=1879680784]
+[node name="TexturesSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="TexturesHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/TexturesSection" unique_id=1264223145]
+[node name="TexturesHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/TexturesSection"]
 layout_mode = 2
 text = "Текстуры:"
 
-[node name="TexturesList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/TexturesSection" unique_id=124058014]
+[node name="TexturesList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/TexturesSection"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3
 
-[node name="AnimationsSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer" unique_id=2418657]
+[node name="AnimationsSection" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer"]
 layout_mode = 2
 size_flags_horizontal = 3
 
-[node name="AnimationsHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/AnimationsSection" unique_id=1775829472]
+[node name="AnimationsHeader" type="Label" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/AnimationsSection"]
 layout_mode = 2
 text = "Анимации:"
 
-[node name="AnimationsList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/AnimationsSection" unique_id=869590601]
+[node name="AnimationsList" type="VBoxContainer" parent="HSplitContainer/HBoxContainer2/HBoxContainer/ModelInfoPanel/ScrollContainer/VBoxContainer/AnimationsSection"]
 layout_mode = 2
 size_flags_horizontal = 3
 size_flags_vertical = 3

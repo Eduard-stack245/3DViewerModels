@@ -62,6 +62,27 @@ var file_dialog:    FileDialog
 var loading_dialog: AcceptDialog
 var message_dialog: AcceptDialog
 
+# ── Light-panel drag / resize state ──────────────────────────────────────────
+var _lp_drag_active:   bool = false
+var _lp_resize_active: bool = false
+
+# ── Batch operations state ───────────────────────────────────────────────────
+var _batch_win:       Window       = null
+var _batch_mode:      int          = 0        # 0 = screenshots, 1 = export info
+var _batch_checks:    Array        = []       # Array[CheckBox]
+var _batch_out_edit:  LineEdit     = null
+var _batch_fmt_opt:   OptionButton = null
+var _batch_progress:  Label        = null
+var _batch_run_btn:   Button       = null
+var _batch_running:   bool         = false
+
+# ── Thumbnail / hover-preview system ─────────────────────────────────────────
+var _thumb_cache:      Dictionary = {}   # path  → ImageTexture (64×64 capture)
+var _thumb_fmt_icons:  Dictionary = {}   # ".glb" → ImageTexture (placeholder)
+var _thumb_popup:      Panel      = null
+var _thumb_popup_img:  TextureRect = null
+var _last_hovered_idx: int        = -1
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Startup
@@ -92,13 +113,18 @@ func _ready() -> void:
 
 	_connect_ui_signals()
 	_create_import_export_buttons()
+	_create_batch_button()
 	_create_collapse_button()
 	_create_info_collapse_button()
 	_register_input_actions()
 	_init_ui()
 	_init_file_dialog()
+	_setup_thumb_system()
 	_restore_last_directory_without_loading_model()
 	_connect_resize_signals()
+	_connect_drag_drop()
+	_create_viewport_toolbar()
+	_create_recent_button()
 
 	call_deferred("_first_layout")
 	print("3DViewModels: ready completed")
@@ -126,6 +152,37 @@ func _register_input_actions() -> void:
 		var key_event := InputEventKey.new()
 		key_event.keycode = KEY_F11
 		InputMap.action_add_event("toggle_fullscreen", key_event)
+
+	if !InputMap.has_action("camera_reset"):
+		InputMap.add_action("camera_reset")
+		var home_ev := InputEventKey.new()
+		home_ev.keycode = KEY_HOME
+		InputMap.action_add_event("camera_reset", home_ev)
+		var r_ev := InputEventKey.new()
+		r_ev.keycode = KEY_R
+		InputMap.action_add_event("camera_reset", r_ev)
+
+	if !InputMap.has_action("toggle_wireframe"):
+		InputMap.add_action("toggle_wireframe")
+		var wf_ev := InputEventKey.new()
+		wf_ev.keycode = KEY_W
+		InputMap.action_add_event("toggle_wireframe", wf_ev)
+
+	# Num 1=Спереди  2=Сзади  3=Справа  4=Слева  7=Сверху  8=Снизу
+	var _numpad_views: Dictionary = {
+		"view_front":  KEY_KP_1,
+		"view_back":   KEY_KP_2,
+		"view_right":  KEY_KP_3,
+		"view_left":   KEY_KP_4,
+		"view_top":    KEY_KP_7,
+		"view_bottom": KEY_KP_8,
+	}
+	for _act: String in _numpad_views:
+		if !InputMap.has_action(_act):
+			InputMap.add_action(_act)
+			var _ev := InputEventKey.new()
+			_ev.keycode = _numpad_views[_act]
+			InputMap.action_add_event(_act, _ev)
 
 
 func _connect_resize_signals() -> void:
@@ -215,6 +272,8 @@ func _apply_layout(force_split: bool) -> void:
 		model_list.custom_minimum_size   = Vector2.ZERO
 		model_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		model_list.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+		model_list.icon_mode             = ItemList.ICON_MODE_LEFT
+		model_list.fixed_icon_size       = Vector2i(32, 32)
 
 	# ── Button bar ───────────────────────────────────────────────────────────
 	if button_container:
@@ -451,6 +510,456 @@ func _toggle_info_panel() -> void:
 			btn.text = "◀"
 
 
+func _create_viewport_toolbar() -> void:
+	if !preview_column:
+		return
+
+	var toolbar := HBoxContainer.new()
+	toolbar.name = "ViewportToolbar"
+	toolbar.add_theme_constant_override("separation", 4)
+
+	# ── Reset camera ──────────────────────────────────────────────────────────
+	var reset_btn := Button.new()
+	reset_btn.text              = "↺"
+	reset_btn.tooltip_text      = "Сброс камеры  [R / Home]"
+	reset_btn.custom_minimum_size.x = 28
+	reset_btn.pressed.connect(func():
+		if viewport_container and viewport_container.current_model:
+			viewport_container.reset_camera()
+	)
+	toolbar.add_child(reset_btn)
+
+	# ── Fit to view ───────────────────────────────────────────────────────────
+	var fit_btn := Button.new()
+	fit_btn.text             = "⊡"
+	fit_btn.tooltip_text     = "Вписать модель в экран  [F]"
+	fit_btn.custom_minimum_size.x = 28
+	fit_btn.pressed.connect(func():
+		if viewport_container and viewport_container.current_model:
+			viewport_container.fit_to_view()
+	)
+	toolbar.add_child(fit_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── View preset dropdown ──────────────────────────────────────────────────
+	var view_btn := MenuButton.new()
+	view_btn.text         = "Вид"
+	view_btn.tooltip_text = "Виды камеры"
+	view_btn.flat         = false
+	var popup := view_btn.get_popup()
+	popup.add_item("Спереди    [Num 1]", 0)
+	popup.add_item("Сзади      [Num 2]", 1)
+	popup.add_item("Слева      [Num 4]", 2)
+	popup.add_item("Справа     [Num 3]", 3)
+	popup.add_item("Сверху     [Num 7]", 4)
+	popup.add_item("Снизу      [Num 8]", 5)
+	popup.index_pressed.connect(func(idx: int):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(idx)
+	)
+	toolbar.add_child(view_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── Grid toggle ───────────────────────────────────────────────────────────
+	var grid_btn := Button.new()
+	grid_btn.name           = "GridToggleBtn"
+	grid_btn.text           = "Сетка"
+	grid_btn.tooltip_text   = "Показать/скрыть сетку пола"
+	grid_btn.toggle_mode    = true
+	grid_btn.button_pressed = true
+	grid_btn.toggled.connect(func(_p: bool):
+		if viewport_container:
+			viewport_container.toggle_grid()
+	)
+	toolbar.add_child(grid_btn)
+
+	# ── Gizmo toggle ──────────────────────────────────────────────────────────
+	var gizmo_btn := Button.new()
+	gizmo_btn.name           = "GizmoToggleBtn"
+	gizmo_btn.text           = "Оси"
+	gizmo_btn.tooltip_text   = "Показать/скрыть оси XYZ"
+	gizmo_btn.toggle_mode    = true
+	gizmo_btn.button_pressed = true
+	gizmo_btn.toggled.connect(func(_p: bool):
+		if viewport_container:
+			viewport_container.toggle_gizmo()
+	)
+	toolbar.add_child(gizmo_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── Wireframe toggle ──────────────────────────────────────────────────────
+	var wf_btn := Button.new()
+	wf_btn.name           = "WireframeToggleBtn"
+	wf_btn.text           = "Каркас"
+	wf_btn.tooltip_text   = "Wireframe  [W вне вьюпорта]"
+	wf_btn.toggle_mode    = true
+	wf_btn.button_pressed = false
+	wf_btn.toggled.connect(func(_p: bool):
+		if viewport_container:
+			viewport_container.toggle_wireframe()
+	)
+	toolbar.add_child(wf_btn)
+
+	# ── Zoom-to-cursor toggle ─────────────────────────────────────────────────
+	var ztc_btn := Button.new()
+	ztc_btn.name           = "ZoomCursorToggleBtn"
+	ztc_btn.text           = "ЗумCursor"
+	ztc_btn.tooltip_text   = "Зум к позиции курсора (вкл/выкл)"
+	ztc_btn.toggle_mode    = true
+	ztc_btn.button_pressed = true   # on by default
+	ztc_btn.toggled.connect(func(_p: bool):
+		if viewport_container:
+			viewport_container.toggle_zoom_to_cursor()
+	)
+	toolbar.add_child(ztc_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── Screenshot ────────────────────────────────────────────────────────────
+	var shot_btn := Button.new()
+	shot_btn.name           = "ScreenshotBtn"
+	shot_btn.text           = "📷"
+	shot_btn.tooltip_text   = "Сохранить скриншот вьюпорта"
+	shot_btn.pressed.connect(_on_screenshot_pressed)
+	toolbar.add_child(shot_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── Environment preset ────────────────────────────────────────────────────
+	var env_btn := MenuButton.new()
+	env_btn.text         = "Фон"
+	env_btn.tooltip_text = "Фон / освещение сцены"
+	env_btn.flat         = false
+	var env_pop := env_btn.get_popup()
+	env_pop.add_item("Серый (по умолчанию)", 0)
+	env_pop.add_item("Тёмный",              1)
+	env_pop.add_item("Белый",               2)
+	env_pop.add_item("Небо (процедурное)",  3)
+	env_pop.add_separator()
+	env_pop.add_item("Загрузить HDRI...", 10)
+	env_pop.index_pressed.connect(func(idx: int) -> void:
+		var item_id: int = env_pop.get_item_id(idx)
+		if item_id == 10:
+			_open_hdri_dialog()
+		elif viewport_container:
+			viewport_container.set_env_preset(item_id)
+	)
+	toolbar.add_child(env_btn)
+
+	# ── Light control toggle ──────────────────────────────────────────────────
+	var light_btn := Button.new()
+	light_btn.name           = "LightControlBtn"
+	light_btn.text           = "Свет"
+	light_btn.tooltip_text   = "Управление источником света"
+	light_btn.toggle_mode    = true
+	light_btn.button_pressed = false
+	light_btn.toggled.connect(func(pressed: bool) -> void:
+		var lp: Panel = get_node_or_null("LightPanel") as Panel
+		if lp:
+			lp.visible = pressed
+	)
+	toolbar.add_child(light_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── Texture channel viewer ────────────────────────────────────────────────
+	var ch_btn := MenuButton.new()
+	ch_btn.text         = "Каналы"
+	ch_btn.tooltip_text = "Просмотр канала текстуры"
+	ch_btn.flat         = false
+	var ch_pop := ch_btn.get_popup()
+	ch_pop.add_radio_check_item("Полный",    0)
+	ch_pop.add_radio_check_item("Albedo",    1)
+	ch_pop.add_radio_check_item("Roughness", 2)
+	ch_pop.add_radio_check_item("Normal",    3)
+	ch_pop.add_radio_check_item("Metallic",  4)
+	ch_pop.set_item_checked(0, true)
+	ch_pop.index_pressed.connect(func(idx: int) -> void:
+		for i: int in range(ch_pop.item_count):
+			ch_pop.set_item_checked(i, i == idx)
+		if viewport_container:
+			viewport_container.set_texture_channel(idx)
+	)
+	toolbar.add_child(ch_btn)
+
+	toolbar.add_child(VSeparator.new())
+
+	# ── FPS counter ───────────────────────────────────────────────────────────
+	var fps_btn := Button.new()
+	fps_btn.name           = "FPSToggleBtn"
+	fps_btn.text           = "FPS"
+	fps_btn.tooltip_text   = "Показать FPS и draw calls"
+	fps_btn.toggle_mode    = true
+	fps_btn.button_pressed = false
+	fps_btn.toggled.connect(func(_p: bool) -> void:
+		if viewport_container:
+			viewport_container.toggle_fps_counter()
+	)
+	toolbar.add_child(fps_btn)
+
+	preview_column.add_child(toolbar)
+	_create_light_panel()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Light control panel
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_light_panel() -> void:
+	var panel := Panel.new()
+	panel.name                = "LightPanel"
+	panel.visible             = false
+	panel.custom_minimum_size = Vector2(300, 500)
+	panel.size                = Vector2(300, 500)
+	# Float the panel over the viewport, just below the toolbar row.
+	panel.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	panel.position = Vector2(170, 60)
+	panel.z_index  = 10
+
+	# Scrollable inner content — cap height so it never overflows the screen
+	var scroll := ScrollContainer.new()
+	scroll.name = "LightPanelScroll"
+	scroll.custom_minimum_size         = Vector2(300, 200)
+	scroll.size_flags_horizontal       = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical         = Control.SIZE_EXPAND_FILL
+	scroll.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT,
+			Control.PRESET_MODE_MINSIZE, 6)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 5)
+	vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(vbox)
+	panel.add_child(scroll)
+
+	# ── Title + close ──────────────────────────────────────────────────────────
+	var title_row := HBoxContainer.new()
+	var title := Label.new()
+	title.text = "Управление светом"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var close_btn := Button.new()
+	close_btn.text = "✕"
+	close_btn.flat = true
+	close_btn.custom_minimum_size = Vector2(24, 24)
+	close_btn.pressed.connect(func() -> void:
+		panel.visible = false
+		var lbtn := get_node_or_null("HSplitContainer/HBoxContainer2/VBoxContainer2/ViewportToolbar/LightControlBtn")
+		if lbtn is Button:
+			(lbtn as Button).button_pressed = false
+	)
+	title_row.add_child(title)
+	title_row.add_child(close_btn)
+	vbox.add_child(title_row)
+	vbox.add_child(HSeparator.new())
+
+	# ── Drag: press on title bar → _input() moves the panel ──────────────────
+	title_row.mouse_filter               = Control.MOUSE_FILTER_STOP
+	title_row.mouse_default_cursor_shape = Control.CURSOR_DRAG
+	title_row.custom_minimum_size.y      = 28
+	title_row.gui_input.connect(func(ev: InputEvent) -> void:
+		if ev is InputEventMouseButton:
+			var mb := ev as InputEventMouseButton
+			if mb.button_index == MOUSE_BUTTON_LEFT:
+				_lp_drag_active = mb.pressed
+	)
+
+	# ── Light presets ──────────────────────────────────────────────────────────
+	var preset_lbl := Label.new()
+	preset_lbl.text = "Пресеты:"
+	preset_lbl.modulate.a = 0.75
+	vbox.add_child(preset_lbl)
+
+	var presets_row := HBoxContainer.new()
+	presets_row.add_theme_constant_override("separation", 4)
+	var _preset_defs: Array = [
+		["Студия", 0], ["Улица", 1], ["Ночь", 2], ["Контур", 3]]
+	for preset_data in _preset_defs:
+		var pb := Button.new()
+		pb.text = str(preset_data[0])
+		pb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		pb.custom_minimum_size.y = 26
+		var pid: int = int(preset_data[1])
+		pb.pressed.connect(func() -> void:
+			if viewport_container:
+				viewport_container.apply_light_preset(pid)
+		)
+		presets_row.add_child(pb)
+	vbox.add_child(presets_row)
+	vbox.add_child(HSeparator.new())
+
+	# ── Main (key) light ───────────────────────────────────────────────────────
+	var key_lbl := Label.new()
+	key_lbl.text = "Основной свет"
+	key_lbl.modulate.a = 0.75
+	vbox.add_child(key_lbl)
+
+	vbox.add_child(_make_slider_row("Горизонталь", -180.0, 180.0, -30.0,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_light_azimuth(v)))
+
+	vbox.add_child(_make_slider_row("Вертикаль", -180.0, 180.0, -60.0,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_light_elevation(v)))
+
+	vbox.add_child(_make_slider_row("Яркость", 0.0, 5.0, 2.0,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_light_energy(v),
+		true))
+
+	var color_row := HBoxContainer.new()
+	var color_lbl := Label.new()
+	color_lbl.text = "Цвет"
+	color_lbl.custom_minimum_size.x = 90
+	var color_picker := ColorPickerButton.new()
+	color_picker.color = Color(1.0, 0.98, 0.95)
+	color_picker.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	color_picker.custom_minimum_size.y = 28
+	color_picker.color_changed.connect(func(c: Color) -> void:
+		if viewport_container: viewport_container.set_light_color(c))
+	color_row.add_child(color_lbl)
+	color_row.add_child(color_picker)
+	vbox.add_child(color_row)
+
+	var shadow_row := HBoxContainer.new()
+	var shadow_lbl := Label.new()
+	shadow_lbl.text = "Тени"
+	shadow_lbl.custom_minimum_size.x = 90
+	var shadow_check := CheckBox.new()
+	shadow_check.text           = "Включить"
+	shadow_check.button_pressed = true
+	shadow_check.toggled.connect(func(on: bool) -> void:
+		if viewport_container: viewport_container.set_shadow_enabled(on))
+	shadow_row.add_child(shadow_lbl)
+	shadow_row.add_child(shadow_check)
+	vbox.add_child(shadow_row)
+	vbox.add_child(HSeparator.new())
+
+	# ── Fill light ─────────────────────────────────────────────────────────────
+	var fill_lbl := Label.new()
+	fill_lbl.text = "Заполняющий свет"
+	fill_lbl.modulate.a = 0.75
+	vbox.add_child(fill_lbl)
+
+	var fill_on_row := HBoxContainer.new()
+	var fill_on_lbl := Label.new()
+	fill_on_lbl.text = "Включён"
+	fill_on_lbl.custom_minimum_size.x = 90
+	var fill_check := CheckBox.new()
+	fill_check.button_pressed = true
+	fill_check.toggled.connect(func(on: bool) -> void:
+		if viewport_container: viewport_container.set_fill_light_enabled(on))
+	fill_on_row.add_child(fill_on_lbl)
+	fill_on_row.add_child(fill_check)
+	vbox.add_child(fill_on_row)
+
+	vbox.add_child(_make_slider_row("Яркость", 0.0, 3.0, 1.0,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_fill_light_energy(v),
+		true))
+	vbox.add_child(HSeparator.new())
+
+	# ── Rim light ──────────────────────────────────────────────────────────────
+	var rim_lbl := Label.new()
+	rim_lbl.text = "Контурный свет (rim)"
+	rim_lbl.modulate.a = 0.75
+	vbox.add_child(rim_lbl)
+
+	var rim_on_row := HBoxContainer.new()
+	var rim_on_lbl := Label.new()
+	rim_on_lbl.text = "Включён"
+	rim_on_lbl.custom_minimum_size.x = 90
+	var rim_check := CheckBox.new()
+	rim_check.button_pressed = true
+	rim_check.toggled.connect(func(on: bool) -> void:
+		if viewport_container: viewport_container.set_rim_light_enabled(on))
+	rim_on_row.add_child(rim_on_lbl)
+	rim_on_row.add_child(rim_check)
+	vbox.add_child(rim_on_row)
+
+	vbox.add_child(_make_slider_row("Яркость", 0.0, 3.0, 0.4,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_rim_light_energy(v),
+		true))
+	vbox.add_child(HSeparator.new())
+
+	# ── Ambient / environment light ────────────────────────────────────────────
+	var amb_lbl := Label.new()
+	amb_lbl.text = "Окружающий свет"
+	amb_lbl.modulate.a = 0.75
+	vbox.add_child(amb_lbl)
+
+	vbox.add_child(_make_slider_row("Яркость", 0.0, 3.0, 1.5,
+		func(v: float) -> void:
+			if viewport_container: viewport_container.set_ambient_energy(v),
+		true))
+
+	# ── Resize grip ────────────────────────────────────────────────────────────
+	var grip := Label.new()
+	grip.text = "⇲"
+	grip.horizontal_alignment            = HORIZONTAL_ALIGNMENT_RIGHT
+	grip.mouse_filter                    = Control.MOUSE_FILTER_STOP
+	grip.mouse_default_cursor_shape      = Control.CURSOR_FDIAGSIZE
+	grip.size_flags_horizontal           = Control.SIZE_EXPAND_FILL
+	grip.custom_minimum_size             = Vector2(0, 20)
+	grip.gui_input.connect(func(ev: InputEvent) -> void:
+		if ev is InputEventMouseButton:
+			var mb := ev as InputEventMouseButton
+			if mb.button_index == MOUSE_BUTTON_LEFT:
+				_lp_resize_active = mb.pressed
+	)
+	vbox.add_child(grip)
+
+	add_child(panel)
+
+
+func _make_slider_row(label_text: String, min_v: float, max_v: float,
+		default_v: float, callback: Callable, is_float: bool = false) -> HBoxContainer:
+	var hbox := HBoxContainer.new()
+	var lbl  := Label.new()
+	lbl.text = label_text
+	lbl.custom_minimum_size.x = 90
+
+	var slider := HSlider.new()
+	slider.min_value = min_v
+	slider.max_value = max_v
+	slider.value     = default_v
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var val_lbl := Label.new()
+	val_lbl.custom_minimum_size.x = 38
+	val_lbl.text = ("%.1f" if is_float else "%d") % default_v
+
+	slider.value_changed.connect(func(v: float) -> void:
+		val_lbl.text = ("%.1f" if is_float else "%d") % v
+		callback.call(v))
+
+	hbox.add_child(lbl)
+	hbox.add_child(slider)
+	hbox.add_child(val_lbl)
+	return hbox
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HDRI file loader
+# ══════════════════════════════════════════════════════════════════════════════
+func _open_hdri_dialog() -> void:
+	var dlg := FileDialog.new()
+	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	dlg.access    = FileDialog.ACCESS_FILESYSTEM
+	dlg.title     = "Загрузить HDRI / панорамное изображение"
+	dlg.size      = Vector2i(800, 500)
+	dlg.add_filter("*.hdr,*.exr,*.png,*.jpg,*.jpeg", "HDRI / Images")
+	dlg.file_selected.connect(func(path: String) -> void:
+		if viewport_container:
+			viewport_container.load_env_hdri(path)
+		dlg.queue_free())
+	dlg.canceled.connect(dlg.queue_free)
+	add_child(dlg)
+	dlg.popup_centered()
+
+
 func _init_file_dialog() -> void:
 	file_dialog = FileDialog.new()
 	file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
@@ -671,6 +1180,32 @@ func _apply_imported_settings(data: Dictionary) -> void:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Input
 # ══════════════════════════════════════════════════════════════════════════════
+func _input(event: InputEvent) -> void:
+	if !_lp_drag_active and !_lp_resize_active:
+		return
+	var lp: Panel = get_node_or_null("LightPanel") as Panel
+	if !lp or !lp.visible:
+		_lp_drag_active   = false
+		_lp_resize_active = false
+		return
+	if event is InputEventMouseButton:
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT and !mb.pressed:
+			_lp_drag_active   = false
+			_lp_resize_active = false
+	elif event is InputEventMouseMotion:
+		var mm := event as InputEventMouseMotion
+		if _lp_drag_active:
+			lp.position += mm.relative
+			get_viewport().set_input_as_handled()
+		elif _lp_resize_active:
+			var new_w := maxf(lp.size.x + mm.relative.x, 240.0)
+			var new_h := maxf(lp.size.y + mm.relative.y, 280.0)
+			lp.custom_minimum_size = Vector2(new_w, new_h)
+			lp.size                = Vector2(new_w, new_h)
+			get_viewport().set_input_as_handled()
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("toggle_rotation"):
 		if viewport_container and viewport_container.current_model:
@@ -684,6 +1219,53 @@ func _unhandled_input(event: InputEvent) -> void:
 				win.mode = Window.MODE_WINDOWED
 			else:
 				win.mode = Window.MODE_FULLSCREEN
+		get_viewport().set_input_as_handled()
+
+	elif event.is_action_pressed("camera_reset"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.reset_camera()
+		get_viewport().set_input_as_handled()
+
+	elif event is InputEventKey and (event as InputEventKey).pressed \
+			and (event as InputEventKey).keycode == KEY_F \
+			and not (event as InputEventKey).is_echo():
+		if viewport_container and viewport_container.current_model:
+			viewport_container.fit_to_view()
+		get_viewport().set_input_as_handled()
+
+	elif event.is_action_pressed("view_front"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(0)
+		get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("view_back"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(1)
+		get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("view_left"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(2)
+		get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("view_right"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(3)
+		get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("view_top"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(4)
+		get_viewport().set_input_as_handled()
+	elif event.is_action_pressed("view_bottom"):
+		if viewport_container and viewport_container.current_model:
+			viewport_container.set_view_preset(5)
+		get_viewport().set_input_as_handled()
+
+	# W toggles wireframe only when mouse is OUTSIDE the viewport (inside = WASD movement)
+	elif event.is_action_pressed("toggle_wireframe"):
+		if viewport_container and viewport_container.current_model \
+				and not viewport_container.mouse_in_viewport:
+			viewport_container.toggle_wireframe()
+			var wf_btn := _get_toolbar_btn("WireframeToggleBtn")
+			if wf_btn:
+				wf_btn.button_pressed = viewport_container.wireframe_enabled
 		get_viewport().set_input_as_handled()
 
 
@@ -704,7 +1286,13 @@ func _on_model_selected(index: int) -> void:
 		_show_message("Ошибка загрузки", result)
 	else:
 		settings.set_setting("last_model", model_path)
+		settings.add_recent_model(model_path)
 		show_model_info(index)
+		# Capture thumbnail after a short delay so the viewport has rendered
+		var captured_path: String = model_path
+		var captured_idx:  int    = index
+		get_tree().create_timer(0.35).timeout.connect(
+			func() -> void: _capture_and_store_thumb(captured_path, captured_idx), CONNECT_ONE_SHOT)
 
 	if loading_dialog:
 		loading_dialog.hide()
@@ -915,6 +1503,151 @@ func update_model_list(search_text: String = "") -> void:
 			filtered_model_paths.append(path)
 			var item_index := model_list.add_item(path.get_file())
 			model_list.set_item_tooltip(item_index, path)
+			# Show cached thumbnail or a colored format-placeholder icon
+			var icon: ImageTexture = _thumb_cache.get(path, null) as ImageTexture
+			if !icon:
+				icon = _get_format_icon(path.get_extension())
+			if icon:
+				model_list.set_item_icon(item_index, icon)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Thumbnail system
+# ══════════════════════════════════════════════════════════════════════════════
+func _setup_thumb_system() -> void:
+	# Create the hover-popup panel (floats over everything, ignores mouse)
+	_thumb_popup = Panel.new()
+	_thumb_popup.name         = "ThumbHoverPopup"
+	_thumb_popup.visible      = false
+	_thumb_popup.z_index      = 200
+	_thumb_popup.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_thumb_popup.custom_minimum_size = Vector2(160, 160)
+	_thumb_popup.size                = Vector2(160, 160)
+
+	_thumb_popup_img = TextureRect.new()
+	_thumb_popup_img.set_anchors_and_offsets_preset(
+			Control.PRESET_FULL_RECT, Control.PRESET_MODE_MINSIZE, 4)
+	_thumb_popup_img.stretch_mode         = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_thumb_popup_img.expand_mode          = TextureRect.EXPAND_IGNORE_SIZE
+	_thumb_popup_img.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_thumb_popup_img.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	_thumb_popup_img.mouse_filter          = Control.MOUSE_FILTER_IGNORE
+	_thumb_popup.add_child(_thumb_popup_img)
+	add_child(_thumb_popup)
+
+	# Hook into the model list for hover detection
+	if model_list:
+		model_list.mouse_exited.connect(func() -> void:
+			_last_hovered_idx = -1
+			if _thumb_popup: _thumb_popup.visible = false
+		)
+		model_list.gui_input.connect(_on_model_list_gui_input)
+
+
+func _on_model_list_gui_input(ev: InputEvent) -> void:
+	if not ev is InputEventMouseMotion:
+		return
+	var mm       := ev as InputEventMouseMotion
+	var hovered  := model_list.get_item_at_position(mm.position, true)
+
+	if hovered == _last_hovered_idx:
+		# Just update popup position while staying on same item
+		if _thumb_popup.visible:
+			_place_thumb_popup()
+		return
+
+	_last_hovered_idx = hovered
+
+	if hovered < 0 or hovered >= filtered_model_paths.size():
+		_thumb_popup.visible = false
+		return
+
+	var path: String = filtered_model_paths[hovered]
+	var tex: ImageTexture = _thumb_cache.get(path, null) as ImageTexture
+	if !tex:
+		_thumb_popup.visible = false
+		return
+
+	_thumb_popup_img.texture = tex
+	_place_thumb_popup()
+	_thumb_popup.visible = true
+
+
+func _place_thumb_popup() -> void:
+	if !model_list or !_thumb_popup:
+		return
+	var win_size   := get_viewport().get_visible_rect().size
+	var popup_size := _thumb_popup.size
+	# Position to the right of the list; if not enough space, flip to the left
+	var list_right := model_list.global_position.x + model_list.size.x + 6.0
+	var x := list_right if list_right + popup_size.x < win_size.x \
+			else model_list.global_position.x - popup_size.x - 6.0
+	var mouse_y := model_list.get_global_mouse_position().y
+	var y := clampf(mouse_y - popup_size.y * 0.5, 0.0, win_size.y - popup_size.y)
+	_thumb_popup.position = Vector2(x, y)
+
+
+func _capture_and_store_thumb(path: String, list_idx: int) -> void:
+	if !viewport_container or !viewport_container.current_model:
+		return
+
+	# Save current camera state so we can restore it after the snapshot
+	var saved_dist:   float   = viewport_container.camera_distance
+	var saved_horiz:  float   = viewport_container.camera_horizontal_angle
+	var saved_vert:   float   = viewport_container.camera_vertical_angle
+	var saved_center: Vector3 = viewport_container.orbit_center
+
+	# Frame the model properly regardless of where the camera currently is
+	viewport_container.fit_to_view()
+
+	# Wait 2 frames so the GPU renders the updated camera position
+	await get_tree().process_frame
+	await get_tree().process_frame
+
+	# Capture only if the same model is still loaded
+	if !viewport_container.current_model:
+		return
+
+	var tex: ImageTexture = viewport_container.capture_thumbnail(Vector2i(128, 128))
+
+	# Restore camera silently so the user doesn't see it jump
+	viewport_container.camera_distance          = saved_dist
+	viewport_container.camera_horizontal_angle  = saved_horiz
+	viewport_container.camera_vertical_angle    = saved_vert
+	viewport_container.orbit_center             = saved_center
+	viewport_container.update_camera_position()
+
+	if !tex:
+		return
+	_thumb_cache[path] = tex
+	if model_list and list_idx < model_list.item_count:
+		model_list.set_item_icon(list_idx, tex)
+
+
+## Returns a small colored square icon for a given file extension (placeholder).
+func _get_format_icon(ext: String) -> ImageTexture:
+	var key := ext.to_lower()
+	if _thumb_fmt_icons.has(key):
+		return _thumb_fmt_icons[key] as ImageTexture
+	var colors := {
+		"glb":  Color(0.15, 0.65, 0.30),
+		"gltf": Color(0.10, 0.55, 0.75),
+		"fbx":  Color(0.85, 0.45, 0.10),
+		"obj":  Color(0.60, 0.20, 0.65)
+	}
+	var bg: Color = colors.get(key, Color(0.45, 0.45, 0.45))
+	var img := Image.create(32, 32, false, Image.FORMAT_RGBA8)
+	img.fill(bg)
+	# Subtle 1 px border
+	var border: Color = bg.darkened(0.35)
+	for i in range(32):
+		img.set_pixel(i, 0,  border)
+		img.set_pixel(i, 31, border)
+		img.set_pixel(0,  i, border)
+		img.set_pixel(31, i, border)
+	var tex := ImageTexture.create_from_image(img)
+	_thumb_fmt_icons[key] = tex
+	return tex
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -928,6 +1661,151 @@ func _format_size(byte_count: int) -> String:
 	return "%.2f MB" % (byte_count / (1024.0 * 1024.0))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Recent models
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_recent_button() -> void:
+	if !left_panel or !button_container:
+		return
+
+	var recent_btn := MenuButton.new()
+	recent_btn.name                    = "RecentButton"
+	recent_btn.text                    = "Недавние ▾"
+	recent_btn.size_flags_horizontal   = Control.SIZE_EXPAND_FILL
+	recent_btn.custom_minimum_size.y   = 28
+	recent_btn.flat                    = false
+
+	recent_btn.about_to_popup.connect(func():
+		var popup := recent_btn.get_popup()
+		popup.clear()
+		var recent: Array = settings.get_recent_models()
+		if recent.is_empty():
+			popup.add_item("Нет недавних моделей", 0)
+			popup.set_item_disabled(0, true)
+		else:
+			for i: int in recent.size():
+				popup.add_item(str(recent[i]).get_file(), i)
+				popup.set_item_tooltip(i, str(recent[i]))
+	)
+
+	recent_btn.get_popup().index_pressed.connect(func(idx: int):
+		var recent: Array = settings.get_recent_models()
+		if idx >= recent.size():
+			return
+		var path := str(recent[idx])
+		if FileAccess.file_exists(path):
+			_load_model_directly(path)
+		else:
+			_show_message("Ошибка", "Файл не найден:\n" + path)
+	)
+
+	left_panel.add_child(recent_btn)
+	left_panel.move_child(recent_btn, button_container.get_index())
+
+
+func _load_model_directly(path: String) -> void:
+	if !model_paths.has(path):
+		model_paths.append(path)
+	update_model_list(search_box.text if search_box else "")
+	var idx := filtered_model_paths.find(path)
+	if idx != -1:
+		model_list.select(idx)
+		_on_model_selected(idx)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Screenshot
+# ══════════════════════════════════════════════════════════════════════════════
+func _on_screenshot_pressed() -> void:
+	if !viewport_container:
+		return
+	var img := viewport_container.take_screenshot()
+	if !img:
+		_show_message("Ошибка", "Не удалось захватить изображение вьюпорта.")
+		return
+
+	var save_dialog := FileDialog.new()
+	save_dialog.file_mode   = FileDialog.FILE_MODE_SAVE_FILE
+	save_dialog.access      = FileDialog.ACCESS_FILESYSTEM
+	save_dialog.title       = "Сохранить скриншот"
+	save_dialog.current_dir = OS.get_system_dir(OS.SYSTEM_DIR_DESKTOP)
+	var ts := Time.get_datetime_dict_from_system()
+	save_dialog.current_file = "screenshot_%04d%02d%02d_%02d%02d%02d.png" % [
+		ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second
+	]
+	save_dialog.add_filter("*.png", "PNG Image")
+	save_dialog.close_requested.connect(save_dialog.queue_free)
+	save_dialog.canceled.connect(save_dialog.queue_free)
+	save_dialog.file_selected.connect(func(save_path: String):
+		var err := img.save_png(save_path)
+		if err == OK:
+			_show_message("Скриншот", "Сохранено:\n" + save_path)
+		else:
+			_show_message("Ошибка", "Не удалось сохранить файл.")
+		save_dialog.queue_free()
+	)
+	add_child(save_dialog)
+	save_dialog.popup_centered(Vector2(800, 600))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Toolbar helpers
+# ══════════════════════════════════════════════════════════════════════════════
+func _get_toolbar_btn(btn_name: String) -> Button:
+	if !preview_column:
+		return null
+	var toolbar := preview_column.get_node_or_null("ViewportToolbar")
+	if !toolbar:
+		return null
+	return toolbar.get_node_or_null(btn_name) as Button
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Drag & Drop (OS file drop)
+# ══════════════════════════════════════════════════════════════════════════════
+func _connect_drag_drop() -> void:
+	var win := get_window()
+	if win and !win.files_dropped.is_connected(_on_files_dropped):
+		win.files_dropped.connect(_on_files_dropped)
+
+
+func _on_files_dropped(files: PackedStringArray) -> void:
+	var dirs:   Array[String] = []
+	var models: Array[String] = []
+
+	for path in files:
+		if DirAccess.dir_exists_absolute(path):
+			dirs.append(path)
+		elif FileAccess.file_exists(path):
+			var ext := path.get_extension().to_lower()
+			if ext in SUPPORTED_EXTENSIONS:
+				models.append(path)
+
+	# Папка имеет приоритет — сканируем её как через кнопку выбора
+	if dirs.size() > 0:
+		var dir := dirs[0]
+		if file_dialog:
+			file_dialog.current_dir = dir
+		_on_project_dir_selected(dir)
+		return
+
+	# Только файлы моделей — добавляем в список и загружаем первый
+	if models.size() > 0:
+		for path in models:
+			if !model_paths.has(path):
+				model_paths.append(path)
+		update_model_list(search_box.text if search_box else "")
+
+		var first_index := filtered_model_paths.find(models[0])
+		if first_index != -1:
+			model_list.select(first_index)
+			_on_model_selected(first_index)
+		return
+
+	# Ничего подходящего не нашли
+	_show_message("Drag & Drop", "Неподдерживаемый формат файла.\nПоддерживаются: " + ", ".join(SUPPORTED_EXTENSIONS))
+
+
 func _show_message(title: String, text: String) -> void:
 	if !message_dialog:
 		print("%s: %s" % [title, text])
@@ -935,3 +1813,341 @@ func _show_message(title: String, text: String) -> void:
 	message_dialog.title       = title
 	message_dialog.dialog_text = text
 	message_dialog.popup_centered()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Batch operations — button, dialog, runners
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_batch_button() -> void:
+	if !button_container:
+		return
+	var btn := MenuButton.new()
+	btn.text                   = "Пакетно"
+	btn.flat                   = false
+	btn.size_flags_horizontal  = Control.SIZE_EXPAND_FILL
+	btn.custom_minimum_size.y  = 28
+	btn.tooltip_text           = "Пакетные операции со всеми моделями"
+	var pop := btn.get_popup()
+	pop.add_item("Скриншоты моделей...",       0)
+	pop.add_item("Экспорт информации (.json / .txt)...", 1)
+	pop.index_pressed.connect(func(idx: int) -> void:
+		_show_batch_dialog(idx)
+	)
+	button_container.add_child(btn)
+
+
+func _show_batch_dialog(mode: int) -> void:
+	_batch_mode = mode
+	if is_instance_valid(_batch_win):
+		_batch_win.queue_free()
+
+	_batch_win = Window.new()
+	_batch_win.title    = "Пакетные скриншоты" if mode == 0 else "Экспорт информации о моделях"
+	_batch_win.size     = Vector2i(500, 580)
+	_batch_win.min_size = Vector2i(380, 400)
+	_batch_win.close_requested.connect(func() -> void:
+		_batch_running = false
+		if is_instance_valid(_batch_win):
+			_batch_win.queue_free()
+			_batch_win = null
+	)
+
+	var vbox := VBoxContainer.new()
+	vbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT, Control.PRESET_MODE_MINSIZE, 10)
+	vbox.add_theme_constant_override("separation", 8)
+	_batch_win.add_child(vbox)
+
+	# ── Select all / none row ─────────────────────────────────────────────────
+	var sel_row := HBoxContainer.new()
+	var sel_all := Button.new()
+	sel_all.text = "Выбрать все"
+	var sel_none := Button.new()
+	sel_none.text = "Снять всё"
+	var cnt_lbl := Label.new()
+	cnt_lbl.text = "Моделей: %d" % model_paths.size()
+	cnt_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cnt_lbl.horizontal_alignment  = HORIZONTAL_ALIGNMENT_RIGHT
+	sel_row.add_child(sel_all)
+	sel_row.add_child(sel_none)
+	sel_row.add_child(cnt_lbl)
+	vbox.add_child(sel_row)
+
+	# ── Scrollable checklist ──────────────────────────────────────────────────
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	scroll.custom_minimum_size.y = 220
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	var cv := VBoxContainer.new()
+	cv.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_batch_checks.clear()
+	for path in model_paths:
+		var cb := CheckBox.new()
+		cb.text              = path.get_file()
+		cb.tooltip_text      = path
+		cb.button_pressed    = true
+		cb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		cv.add_child(cb)
+		_batch_checks.append(cb)
+	scroll.add_child(cv)
+	vbox.add_child(scroll)
+
+	# Wire select-all / none after _batch_checks is populated
+	sel_all.pressed.connect(func() -> void:
+		for c in _batch_checks:
+			if c is CheckBox: (c as CheckBox).button_pressed = true)
+	sel_none.pressed.connect(func() -> void:
+		for c in _batch_checks:
+			if c is CheckBox: (c as CheckBox).button_pressed = false)
+
+	vbox.add_child(HSeparator.new())
+
+	# ── Options ───────────────────────────────────────────────────────────────
+	var opts := VBoxContainer.new()
+	opts.add_theme_constant_override("separation", 6)
+
+	if mode == 0:
+		# Screenshot — choose output folder
+		var row := HBoxContainer.new()
+		var lbl := Label.new()
+		lbl.text = "Папка:"
+		lbl.custom_minimum_size.x = 90
+		_batch_out_edit = LineEdit.new()
+		_batch_out_edit.placeholder_text  = "Выберите папку для сохранения..."
+		_batch_out_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var browse := Button.new()
+		browse.text = "…"
+		browse.pressed.connect(_open_batch_dir_dialog)
+		row.add_child(lbl); row.add_child(_batch_out_edit); row.add_child(browse)
+		opts.add_child(row)
+	else:
+		# Export info — format + output file
+		var fmt_row := HBoxContainer.new()
+		var fmt_lbl := Label.new()
+		fmt_lbl.text = "Формат:"
+		fmt_lbl.custom_minimum_size.x = 90
+		_batch_fmt_opt = OptionButton.new()
+		_batch_fmt_opt.add_item("JSON  (.json)", 0)
+		_batch_fmt_opt.add_item("Текст (.txt)",  1)
+		_batch_fmt_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		fmt_row.add_child(fmt_lbl); fmt_row.add_child(_batch_fmt_opt)
+		opts.add_child(fmt_row)
+
+		var file_row := HBoxContainer.new()
+		var file_lbl := Label.new()
+		file_lbl.text = "Файл:"
+		file_lbl.custom_minimum_size.x = 90
+		_batch_out_edit = LineEdit.new()
+		_batch_out_edit.placeholder_text  = "Выберите файл сохранения..."
+		_batch_out_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var browse2 := Button.new()
+		browse2.text = "…"
+		browse2.pressed.connect(_open_batch_file_dialog)
+		file_row.add_child(file_lbl); file_row.add_child(_batch_out_edit); file_row.add_child(browse2)
+		opts.add_child(file_row)
+
+		# Update default file extension when format changes
+		_batch_fmt_opt.item_selected.connect(func(_i: int) -> void:
+			if _batch_out_edit and _batch_out_edit.text.strip_edges() != "":
+				var base := _batch_out_edit.text.get_basename()
+				_batch_out_edit.text = base + (".json" if _batch_fmt_opt.selected == 0 else ".txt")
+		)
+
+	vbox.add_child(opts)
+	vbox.add_child(HSeparator.new())
+
+	# ── Progress + buttons ────────────────────────────────────────────────────
+	_batch_progress = Label.new()
+	_batch_progress.text         = ""
+	_batch_progress.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_batch_progress.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vbox.add_child(_batch_progress)
+
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", 6)
+	var close_btn := Button.new()
+	close_btn.text = "Закрыть"
+	close_btn.pressed.connect(func() -> void:
+		_batch_running = false
+		if is_instance_valid(_batch_win):
+			_batch_win.queue_free()
+			_batch_win = null
+	)
+	_batch_run_btn = Button.new()
+	_batch_run_btn.text = "▶  Запустить"
+	_batch_run_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_batch_run_btn.pressed.connect(_on_batch_run_pressed)
+	btn_row.add_child(close_btn)
+	btn_row.add_child(_batch_run_btn)
+	vbox.add_child(btn_row)
+
+	add_child(_batch_win)
+	_batch_win.popup_centered()
+
+
+func _on_batch_run_pressed() -> void:
+	if _batch_running:
+		return
+	var selected: Array[String] = []
+	for i in _batch_checks.size():
+		var cb := _batch_checks[i] as CheckBox
+		if cb and cb.button_pressed and i < model_paths.size():
+			selected.append(model_paths[i])
+	if selected.is_empty():
+		_batch_progress.text = "⚠ Не выбрана ни одна модель."
+		return
+	var out_path := (_batch_out_edit.text.strip_edges() if _batch_out_edit else "")
+	if out_path.is_empty():
+		_batch_progress.text = "⚠ Укажите папку / файл вывода."
+		return
+	_batch_running = true
+	_batch_run_btn.disabled = true
+	_batch_run_btn.text = "⏳ Обработка..."
+	if _batch_mode == 0:
+		_run_batch_screenshots(selected, out_path)
+	else:
+		var use_json: bool = !_batch_fmt_opt or _batch_fmt_opt.selected == 0
+		_run_batch_export_info(selected, out_path, use_json)
+
+
+func _run_batch_screenshots(paths: Array[String], output_dir: String) -> void:
+	if !DirAccess.dir_exists_absolute(output_dir):
+		DirAccess.make_dir_recursive_absolute(output_dir)
+	var saved := 0
+	var failed := 0
+	for i in paths.size():
+		var path: String = paths[i]
+		if !is_instance_valid(_batch_win):
+			break   # dialog closed — abort
+		if _batch_progress and is_instance_valid(_batch_progress):
+			_batch_progress.text = "⏳ %d / %d  —  %s" % [i + 1, paths.size(), path.get_file()]
+		var result := viewport_container.load_in_preview_portal(path)
+		if result != "Модель загружена успешно":
+			failed += 1
+			continue
+		# Fit the model into frame so the screenshot isn't empty
+		viewport_container.fit_to_view()
+		# Wait several frames so the renderer draws the updated camera
+		await get_tree().process_frame
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var img: Image = viewport_container.get_screenshot_image()
+		if !img:
+			failed += 1
+			continue
+		var file_name := path.get_file().get_basename() + ".png"
+		var save_path := output_dir.path_join(file_name)
+		if img.save_png(save_path) == OK:
+			saved += 1
+		else:
+			failed += 1
+	# Restore the previously selected model
+	var sel := model_list.get_selected_items()
+	if sel.size() > 0 and sel[0] < filtered_model_paths.size():
+		viewport_container.load_in_preview_portal(filtered_model_paths[int(sel[0])])
+	_batch_running = false
+	if _batch_run_btn and is_instance_valid(_batch_run_btn):
+		_batch_run_btn.disabled = false
+		_batch_run_btn.text = "▶  Запустить"
+	if _batch_progress and is_instance_valid(_batch_progress):
+		_batch_progress.text = "✓ Готово: %d сохранено, %d ошибок.\nПапка: %s" \
+				% [saved, failed, output_dir]
+
+
+func _run_batch_export_info(paths: Array[String], output_path: String,
+		use_json: bool) -> void:
+	var parent_dir := output_path.get_base_dir()
+	if !DirAccess.dir_exists_absolute(parent_dir):
+		DirAccess.make_dir_recursive_absolute(parent_dir)
+	var ok := false
+	if use_json:
+		ok = _export_info_json(paths, output_path)
+	else:
+		ok = _export_info_txt(paths, output_path)
+	_batch_running = false
+	if _batch_run_btn and is_instance_valid(_batch_run_btn):
+		_batch_run_btn.disabled = false
+		_batch_run_btn.text = "▶  Запустить"
+	if _batch_progress and is_instance_valid(_batch_progress):
+		if ok:
+			_batch_progress.text = "✓ Сохранено %d записей:\n%s" \
+					% [paths.size(), output_path]
+		else:
+			_batch_progress.text = "✗ Ошибка: не удалось записать файл."
+
+
+func _export_info_json(paths: Array[String], output_path: String) -> bool:
+	var arr: Array = []
+	for path in paths:
+		var inf := get_model_info(path)
+		arr.append({
+			"filename":      inf.get("filename", ""),
+			"path":          inf.get("path", ""),
+			"type":          inf.get("type", ""),
+			"size":          inf.get("size", ""),
+			"date_modified": inf.get("date_modified", "")
+		})
+	var file := FileAccess.open(output_path, FileAccess.WRITE)
+	if !file:
+		return false
+	file.store_string(JSON.stringify(arr, "\t"))
+	file.close()
+	return true
+
+
+func _export_info_txt(paths: Array[String], output_path: String) -> bool:
+	var file := FileAccess.open(output_path, FileAccess.WRITE)
+	if !file:
+		return false
+	file.store_line("Экспорт информации о моделях")
+	file.store_line("Дата: " + Time.get_datetime_string_from_system())
+	file.store_line("Количество: %d" % paths.size())
+	file.store_line("")
+	for path in paths:
+		var inf := get_model_info(path)
+		file.store_line("=".repeat(48))
+		file.store_line("Файл:    " + str(inf.get("filename", "")))
+		file.store_line("Путь:    " + str(inf.get("path", "")))
+		file.store_line("Тип:     " + str(inf.get("type", "")))
+		file.store_line("Размер:  " + str(inf.get("size", "")))
+		file.store_line("Изменён: " + str(inf.get("date_modified", "")))
+		file.store_line("")
+	file.close()
+	return true
+
+
+func _open_batch_dir_dialog() -> void:
+	var dlg := FileDialog.new()
+	dlg.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	dlg.access    = FileDialog.ACCESS_FILESYSTEM
+	dlg.title     = "Папка для сохранения скриншотов"
+	dlg.size      = Vector2i(800, 500)
+	dlg.dir_selected.connect(func(dir: String) -> void:
+		if _batch_out_edit and is_instance_valid(_batch_out_edit):
+			_batch_out_edit.text = dir
+		dlg.queue_free()
+	)
+	dlg.canceled.connect(dlg.queue_free)
+	add_child(dlg)
+	dlg.popup_centered()
+
+
+func _open_batch_file_dialog() -> void:
+	var use_json := !_batch_fmt_opt or _batch_fmt_opt.selected == 0
+	var dlg := FileDialog.new()
+	dlg.file_mode    = FileDialog.FILE_MODE_SAVE_FILE
+	dlg.access       = FileDialog.ACCESS_FILESYSTEM
+	dlg.title        = "Сохранить файл экспорта"
+	dlg.size         = Vector2i(800, 500)
+	dlg.current_file = "models_info.json" if use_json else "models_info.txt"
+	if use_json:
+		dlg.add_filter("*.json", "JSON")
+	else:
+		dlg.add_filter("*.txt",  "Текст")
+	dlg.file_selected.connect(func(path: String) -> void:
+		if _batch_out_edit and is_instance_valid(_batch_out_edit):
+			_batch_out_edit.text = path
+		dlg.queue_free()
+	)
+	dlg.canceled.connect(dlg.queue_free)
+	add_child(dlg)
+	dlg.popup_centered()
