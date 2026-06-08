@@ -39,7 +39,7 @@ const INFO_W := { LayoutMode.COMPACT: 0,   LayoutMode.NARROW: 160, LayoutMode.NO
 const MIN_WINDOW_SIZE   := Vector2(520, 320)
 const DEFAULT_WINDOW_SIZE := Vector2i(1100, 700)
 
-const AUTO_SCAN_LAST_DIRECTORY_ON_START := false
+const AUTO_SCAN_LAST_DIRECTORY_ON_START := true    # restore last project on startup
 const AUTO_LOAD_LAST_MODEL_ON_START     := false
 const SUPPORTED_EXTENSIONS: Array[String] = ["glb", "gltf", "obj", "fbx"]
 
@@ -58,7 +58,9 @@ var _split_before_info_collapse: int    = 0
 
 var model_paths:          Array[String] = []
 var filtered_model_paths: Array[String] = []
-var file_dialog:    FileDialog
+var file_dialog:         FileDialog
+var _copy_dest_dialog:   FileDialog = null
+var _pending_copy_paths: Array[String] = []
 var loading_dialog: AcceptDialog
 var message_dialog: AcceptDialog
 
@@ -82,6 +84,28 @@ var _thumb_fmt_icons:  Dictionary = {}   # ".glb" → ImageTexture (placeholder)
 var _thumb_popup:      Panel      = null
 var _thumb_popup_img:  TextureRect = null
 var _last_hovered_idx: int        = -1
+
+# ── Model-list right-click context menu ───────────────────────────────────────
+var _list_context_menu: PopupMenu = null
+var _loaded_model_path: String    = ""   # path of the model currently in viewport
+
+# ── Favorites / tab system ────────────────────────────────────────────────────
+var _active_tab:   int    = 0   # 0 = All models, 1 = Favorites
+var _tab_all_btn:  Button = null
+var _tab_fav_btn:  Button = null
+
+# ── Status bar ────────────────────────────────────────────────────────────────
+var _status_label:       Label  = null
+var _status_busy_text:   String = ""
+
+# ── Progress popup window ──────────────────────────────────────────────────────
+const PROGRESS_THRESHOLD_MS := 250   # don't show window for ops faster than this
+
+var _prog_win:         Window      = null
+var _progress_bar:     ProgressBar = null   # bar inside _prog_win
+var _prog_stage_label: Label       = null   # current-stage text inside window
+var _prog_pct_label:   Label       = null   # "55%" text inside window
+var _op_start_msec:    int         = 0      # Time.get_ticks_msec() when op began
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,6 +149,13 @@ func _ready() -> void:
 	_connect_drag_drop()
 	_create_viewport_toolbar()
 	_create_recent_button()
+	_create_list_tabs()
+	_create_status_bar()
+	_create_progress_window()
+
+	# Connect loading-stage signal so the status bar shows live progress text
+	if viewport_container:
+		viewport_container.loading_stage.connect(_on_loading_stage)
 
 	call_deferred("_first_layout")
 	print("3DViewModels: ready completed")
@@ -274,6 +305,7 @@ func _apply_layout(force_split: bool) -> void:
 		model_list.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 		model_list.icon_mode             = ItemList.ICON_MODE_LEFT
 		model_list.fixed_icon_size       = Vector2i(32, 32)
+		model_list.select_mode           = ItemList.SELECT_MULTI
 
 	# ── Button bar ───────────────────────────────────────────────────────────
 	if button_container:
@@ -375,8 +407,13 @@ func _exit_tree() -> void:
 func _connect_ui_signals() -> void:
 	if model_list:
 		model_list.clear()
-		if !model_list.item_selected.is_connected(_on_model_selected):
-			model_list.item_selected.connect(_on_model_selected)
+		# item_selected is intentionally NOT connected in SELECT_MULTI mode:
+		# clicking an already-selected item deselects it (toggle) and never
+		# fires item_selected, so model loading is driven by item_clicked instead.
+		if model_list.item_selected.is_connected(_on_model_selected):
+			model_list.item_selected.disconnect(_on_model_selected)
+		if !model_list.item_clicked.is_connected(_on_model_list_item_clicked):
+			model_list.item_clicked.connect(_on_model_list_item_clicked)
 
 	if select_project_button and !select_project_button.pressed.is_connected(_on_select_project_pressed):
 		select_project_button.pressed.connect(_on_select_project_pressed)
@@ -590,16 +627,16 @@ func _create_viewport_toolbar() -> void:
 
 	toolbar.add_child(VSeparator.new())
 
-	# ── Wireframe toggle ──────────────────────────────────────────────────────
+	# ── Wireframe cycle button  (Off → Overlay → Only → Off …) ───────────────
 	var wf_btn := Button.new()
-	wf_btn.name           = "WireframeToggleBtn"
-	wf_btn.text           = "Каркас"
-	wf_btn.tooltip_text   = "Wireframe  [W вне вьюпорта]"
-	wf_btn.toggle_mode    = true
-	wf_btn.button_pressed = false
-	wf_btn.toggled.connect(func(_p: bool):
+	wf_btn.name         = "WireframeToggleBtn"
+	wf_btn.text         = "Каркас"
+	wf_btn.tooltip_text = "Режим каркаса [W вне вьюпорта]\nВыкл → Поверх (solid+wire) → Только каркас"
+	wf_btn.toggle_mode  = false
+	wf_btn.pressed.connect(func():
 		if viewport_container:
 			viewport_container.toggle_wireframe()
+			_update_wireframe_btn_text()
 	)
 	toolbar.add_child(wf_btn)
 
@@ -1056,6 +1093,7 @@ func _load_saved_settings() -> void:
 		return
 
 	model_list.select(model_index)
+	model_list.call_deferred("scroll_to_item", model_index)
 	await get_tree().create_timer(0.1).timeout
 	_on_model_selected(model_index)
 
@@ -1172,6 +1210,7 @@ func _apply_imported_settings(data: Dictionary) -> void:
 		var model_index := filtered_model_paths.find(imported_model_path)
 		if model_index != -1:
 			model_list.select(model_index)
+			model_list.call_deferred("scroll_to_item", model_index)
 			_on_model_selected(model_index)
 
 	viewport_container.update_camera_position()
@@ -1258,14 +1297,12 @@ func _unhandled_input(event: InputEvent) -> void:
 			viewport_container.set_view_preset(5)
 		get_viewport().set_input_as_handled()
 
-	# W toggles wireframe only when mouse is OUTSIDE the viewport (inside = WASD movement)
+	# W cycles wireframe mode only when mouse is OUTSIDE the viewport (inside = WASD movement)
 	elif event.is_action_pressed("toggle_wireframe"):
 		if viewport_container and viewport_container.current_model \
 				and not viewport_container.mouse_in_viewport:
 			viewport_container.toggle_wireframe()
-			var wf_btn := _get_toolbar_btn("WireframeToggleBtn")
-			if wf_btn:
-				wf_btn.button_pressed = viewport_container.wireframe_enabled
+			_update_wireframe_btn_text()
 		get_viewport().set_input_as_handled()
 
 
@@ -1277,14 +1314,29 @@ func _on_model_selected(index: int) -> void:
 	if index < 0 or index >= filtered_model_paths.size():
 		return
 
-	if loading_dialog:
-		loading_dialog.popup_centered()
-
 	var model_path := filtered_model_paths[index]
+	var file_name  := model_path.get_file()
+
+	_set_status("⏳ Загрузка %s..." % file_name)
+	if _prog_win:
+		_prog_win.title = "Загрузка: " + file_name
+	if _prog_stage_label:
+		_prog_stage_label.text = "⏳ Загрузка %s..." % file_name
+	_op_start_msec = Time.get_ticks_msec()   # start the threshold clock
+
 	var result := viewport_container.load_in_preview_portal(model_path)
+
+	# Only flash 100% + wait if the window actually opened (slow load).
+	if _prog_win and _prog_win.visible:
+		_show_progress(100.0)
+		await get_tree().create_timer(0.35).timeout
+	_hide_progress()
+
 	if result != "Модель загружена успешно":
+		_set_status("⚠  %s" % result, 10.0)
 		_show_message("Ошибка загрузки", result)
 	else:
+		_loaded_model_path = model_path
 		settings.set_setting("last_model", model_path)
 		settings.add_recent_model(model_path)
 		show_model_info(index)
@@ -1293,9 +1345,421 @@ func _on_model_selected(index: int) -> void:
 		var captured_idx:  int    = index
 		get_tree().create_timer(0.35).timeout.connect(
 			func() -> void: _capture_and_store_thumb(captured_path, captured_idx), CONNECT_ONE_SHOT)
+		# Show success status with file name — auto-clears after 8 s
+		_set_status("✓  " + file_name, 8.0)
 
-	if loading_dialog:
-		loading_dialog.hide()
+
+func _on_model_list_item_clicked(index: int, _at_pos: Vector2, mouse_button: int) -> void:
+	if mouse_button == MOUSE_BUTTON_LEFT:
+		var ctrl  := Input.is_key_pressed(KEY_CTRL)
+		var shift := Input.is_key_pressed(KEY_SHIFT)
+		if not ctrl and not shift:
+			# Plain left-click: select only this item and load the model.
+			# Calling directly because SELECT_MULTI toggles on re-click and
+			# item_selected never fires when the item was already selected.
+			model_list.select(index)   # single=true (default): deselects others
+			_on_model_selected(index)
+		# Ctrl/Shift: ItemList handles multi-selection naturally; don't load model.
+		return
+
+	if mouse_button != MOUSE_BUTTON_RIGHT:
+		return
+	if index < 0 or index >= filtered_model_paths.size():
+		return
+
+	# If right-clicked item is not in the current selection → select only it
+	var sel := model_list.get_selected_items()
+	if index not in sel:
+		model_list.deselect_all()
+		model_list.select(index)
+
+	# Lazy-create the popup once
+	if !_list_context_menu:
+		_list_context_menu = PopupMenu.new()
+		_list_context_menu.name = "ModelListContextMenu"
+		add_child(_list_context_menu)
+		_list_context_menu.id_pressed.connect(_on_list_context_menu_id_pressed)
+
+	var sel_now    := model_list.get_selected_items()
+	var n          := sel_now.size()
+	var lbl        := "(%d)" % n if n > 1 else ""
+
+	# Determine star state for selected items to show the right primary action
+	var favs: Array    = settings.get_favorites()
+	var all_fav := true
+	var any_fav := false
+	for si in sel_now:
+		if si < filtered_model_paths.size():
+			if filtered_model_paths[si] in favs:
+				any_fav = true
+			else:
+				all_fav = false
+
+	_list_context_menu.clear()
+	_list_context_menu.add_item("📋  Копировать путь %s"              % lbl, 0)
+	_list_context_menu.add_item("📋  Копировать путь + текстуры %s"   % lbl, 1)
+	_list_context_menu.add_item("📂  Показать в проводнике %s"        % lbl, 2)
+	_list_context_menu.add_item("📁  Копировать файлы в папку... %s"  % lbl, 5)
+	_list_context_menu.add_separator()
+	if all_fav:
+		# All selected are already favourites → offer only removal
+		_list_context_menu.add_item("★  Убрать из избранного %s"      % lbl, 4)
+	elif any_fav:
+		# Mixed: some in, some out — offer both
+		_list_context_menu.add_item("☆  В избранное %s"               % lbl, 3)
+		_list_context_menu.add_item("★  Убрать из избранного %s"      % lbl, 4)
+	else:
+		# None are favourites → offer only adding
+		_list_context_menu.add_item("☆  В избранное %s"               % lbl, 3)
+	_list_context_menu.position = DisplayServer.mouse_get_position()
+	_list_context_menu.reset_size()
+	_list_context_menu.popup()
+
+
+# Returns model path  +  any associated material/texture file paths.
+func _get_associated_files(model_path: String) -> Array[String]:
+	var result: Array[String] = [model_path]
+	var ext := model_path.get_extension().to_lower()
+
+	# OBJ → companion .mtl file
+	if ext == "obj":
+		var mtl := model_path.get_basename() + ".mtl"
+		if FileAccess.file_exists(mtl) and mtl not in result:
+			result.append(mtl)
+
+	# Currently loaded model → add real texture file paths via the viewport
+	if model_path == _loaded_model_path and viewport_container \
+			and viewport_container.has_method("get_texture_file_paths"):
+		for p: String in viewport_container.get_texture_file_paths():
+			if p not in result:
+				result.append(p)
+
+	return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Copy models + dependencies to a folder
+# ══════════════════════════════════════════════════════════════════════════════
+
+func _show_copy_dest_dialog(sel_paths: Array[String]) -> void:
+	if !_copy_dest_dialog:
+		_copy_dest_dialog = FileDialog.new()
+		_copy_dest_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+		_copy_dest_dialog.access    = FileDialog.ACCESS_FILESYSTEM
+		_copy_dest_dialog.title     = "Выберите папку назначения"
+		_copy_dest_dialog.size      = Vector2(800, 600)
+		_copy_dest_dialog.min_size  = Vector2(400, 300)
+		_copy_dest_dialog.canceled.connect(func(): _copy_dest_dialog.hide())
+		_copy_dest_dialog.dir_selected.connect(_on_copy_dest_dir_selected)
+		add_child(_copy_dest_dialog)
+	_pending_copy_paths = sel_paths.duplicate()
+	_copy_dest_dialog.popup_centered()
+
+
+func _on_copy_dest_dir_selected(target_dir: String) -> void:
+	_copy_models_to_dir(_pending_copy_paths, target_dir)
+	_pending_copy_paths.clear()
+
+
+## Resolve a relative or absolute reference path against base_dir and add to deps if the file exists.
+func _resolve_dep(ref_path: String, base_dir: String, deps: Array[String]) -> void:
+	if ref_path.is_empty() or ref_path.begins_with("data:") or ref_path.begins_with("#"):
+		return
+	var abs_path: String
+	if ref_path.is_absolute_path():
+		abs_path = ref_path.simplify_path()
+	else:
+		abs_path = (base_dir + "/" + ref_path).simplify_path()
+	if FileAccess.file_exists(abs_path) and abs_path not in deps:
+		deps.append(abs_path)
+
+
+## Parse OBJ file for referenced MTL files, then parse each MTL for texture maps.
+func _parse_obj_deps(obj_path: String, dir: String, deps: Array[String]) -> void:
+	var fa := FileAccess.open(obj_path, FileAccess.READ)
+	if !fa:
+		return
+	var mtl_abs_list: Array[String] = []
+	while !fa.eof_reached():
+		var line := fa.get_line().strip_edges()
+		if line.begins_with("mtllib "):
+			var name := line.substr(7).strip_edges()
+			_resolve_dep(name, dir, deps)
+			var abs_mtl := (dir + "/" + name).simplify_path()
+			if FileAccess.file_exists(abs_mtl) and abs_mtl not in mtl_abs_list:
+				mtl_abs_list.append(abs_mtl)
+	fa.close()
+	for mtl_path in mtl_abs_list:
+		_parse_mtl_deps(mtl_path, mtl_path.get_base_dir(), deps)
+
+
+## Parse MTL file for texture map paths.
+func _parse_mtl_deps(mtl_path: String, dir: String, deps: Array[String]) -> void:
+	var fa := FileAccess.open(mtl_path, FileAccess.READ)
+	if !fa:
+		return
+	while !fa.eof_reached():
+		var line := fa.get_line().strip_edges()
+		var low := line.to_lower()
+		# Match any map_ directive or bump/disp/norm/refl shorthand
+		var is_map := low.begins_with("map_") or low.begins_with("bump ") \
+				or low.begins_with("disp ") or low.begins_with("norm ") \
+				or low.begins_with("refl ")
+		if not is_map:
+			continue
+		# The texture filename is the last token that doesn't start with '-'
+		# (earlier tokens may be -option value pairs like "-s 1 1 1 filename")
+		var parts := line.split(" ", false)
+		var tex_name := ""
+		var i := parts.size() - 1
+		while i >= 1:
+			if parts[i].begins_with("-"):
+				i -= 2
+			else:
+				tex_name = parts[i]
+				break
+			i -= 1
+		if tex_name != "":
+			_resolve_dep(tex_name, dir, deps)
+	fa.close()
+
+
+## Parse GLTF JSON for external buffer (.bin) and image URIs.
+func _parse_gltf_deps(gltf_path: String, dir: String, deps: Array[String]) -> void:
+	var fa := FileAccess.open(gltf_path, FileAccess.READ)
+	if !fa:
+		return
+	var parsed: Variant = JSON.parse_string(fa.get_as_text())
+	fa.close()
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return
+	var gltf := parsed as Dictionary
+	for section in ["buffers", "images"]:
+		if not gltf.has(section):
+			continue
+		for entry: Variant in (gltf[section] as Array):
+			if typeof(entry) == TYPE_DICTIONARY and (entry as Dictionary).has("uri"):
+				_resolve_dep(str(entry["uri"]), dir, deps)
+
+
+## Parse Collada (.dae) XML for <init_from> image references.
+func _parse_dae_deps(dae_path: String, dir: String, deps: Array[String]) -> void:
+	var parser := XMLParser.new()
+	if parser.open(dae_path) != OK:
+		return
+	while parser.read() == OK:
+		if parser.get_node_type() != XMLParser.NODE_ELEMENT:
+			continue
+		if parser.get_node_name() != "init_from":
+			continue
+		if parser.read() == OK and parser.get_node_type() == XMLParser.NODE_TEXT:
+			var ref_path := parser.get_node_data().strip_edges()
+			# Strip file:// prefix that some exporters add
+			if ref_path.begins_with("file://"):
+				ref_path = ref_path.substr(7)
+			_resolve_dep(ref_path, dir, deps)
+
+
+## Return all external file paths referenced by model_path (does not include model_path itself).
+func _gather_model_deps(model_path: String) -> Array[String]:
+	var deps: Array[String] = []
+	var dir := model_path.get_base_dir()
+	match model_path.get_extension().to_lower():
+		"obj":  _parse_obj_deps(model_path, dir, deps)
+		"gltf": _parse_gltf_deps(model_path, dir, deps)
+		"dae":  _parse_dae_deps(model_path, dir, deps)
+		# glb / fbx / blend — self-contained or binary; no text parsing needed
+	return deps
+
+
+## Find the deepest directory that is an ancestor of every path in the array.
+func _common_base_dir(paths: Array[String]) -> String:
+	if paths.is_empty():
+		return ""
+	var base := paths[0].get_base_dir()
+	for i in range(1, paths.size()):
+		var d := paths[i].get_base_dir()
+		while d != base and not d.begins_with(base + "/"):
+			var parent := base.get_base_dir()
+			if parent == base:   # reached filesystem root
+				break
+			base = parent
+	return base
+
+
+func _plural_files(n: int) -> String:
+	if n % 100 in range(11, 20):
+		return "ов"
+	match n % 10:
+		1: return ""
+		2, 3, 4: return "а"
+		_: return "ов"
+
+
+## Copy sel_paths and all their external dependencies into target_dir,
+## preserving relative directory structure from the common ancestor.
+func _copy_models_to_dir(sel_paths: Array[String], target_dir: String) -> void:
+	_set_status("📋 Сбор зависимостей...")
+
+	var all_files: Array[String] = []
+	for model_path in sel_paths:
+		if model_path not in all_files:
+			all_files.append(model_path)
+		for dep in _gather_model_deps(model_path):
+			if dep not in all_files:
+				all_files.append(dep)
+
+	if all_files.is_empty():
+		_set_status("⚠ Нет файлов для копирования", 5.0)
+		return
+
+	var base := _common_base_dir(all_files)
+	var base_prefix := base + "/"    # used for prefix stripping
+
+	_set_status("📋 Копирование %d файл%s..." % [all_files.size(), _plural_files(all_files.size())])
+
+	var copied := 0
+	var errors := 0
+
+	for src_path in all_files:
+		# Compute relative path from common base; fall back to filename-only
+		var rel: String
+		if src_path.begins_with(base_prefix):
+			rel = src_path.substr(base_prefix.length())
+		else:
+			rel = src_path.get_file()
+
+		var dst_path := (target_dir + "/" + rel).simplify_path()
+		var dst_dir  := dst_path.get_base_dir()
+
+		if not DirAccess.dir_exists_absolute(dst_dir):
+			var mk_err := DirAccess.make_dir_recursive_absolute(dst_dir)
+			if mk_err != OK:
+				push_error("Cannot create dir: %s (%s)" % [dst_dir, mk_err])
+				errors += 1
+				continue
+
+		var cp_err := DirAccess.copy_absolute(src_path, dst_path)
+		if cp_err == OK:
+			copied += 1
+		else:
+			push_error("Copy failed: %s → %s (%s)" % [src_path, dst_path, cp_err])
+			errors += 1
+
+	var msg := "✓ Скопировано %d файл%s в %s" % [
+		copied, _plural_files(copied), target_dir.get_file()
+	]
+	if errors > 0:
+		msg += " (ошибок: %d)" % errors
+	_set_status(msg, 10.0)
+
+
+func _on_list_context_menu_id_pressed(id: int) -> void:
+	var sel_indices := model_list.get_selected_items()
+	if sel_indices.is_empty():
+		return
+
+	# Build list of selected model paths
+	var sel_paths: Array[String] = []
+	for i in sel_indices:
+		if i < filtered_model_paths.size():
+			sel_paths.append(filtered_model_paths[i])
+	if sel_paths.is_empty():
+		return
+
+	match id:
+		0:  # ── Copy model paths only ────────────────────────────────────────
+			DisplayServer.clipboard_set("\n".join(sel_paths))
+
+		1:  # ── Copy paths + textures / materials ───────────────────────────
+			var all_files: Array[String] = []
+			for p in sel_paths:
+				for f in _get_associated_files(p):
+					if f not in all_files:
+						all_files.append(f)
+			DisplayServer.clipboard_set("\n".join(all_files))
+
+		2:  # ── Show in file manager (multi-select aware) ──────────────────
+			_reveal_in_explorer(sel_paths)
+
+		3:  # ── Add to favourites ──────────────────────────────────────────────
+			_modify_favorites(sel_paths, true)
+
+		4:  # ── Remove from favourites ────────────────────────────────────────
+			_modify_favorites(sel_paths, false)
+
+		5:  # ── Copy files (model + deps) to a folder ────────────────────────
+			_show_copy_dest_dialog(sel_paths)
+
+
+# ── Reveal in file manager (single or multi-file) ───────────────────────────
+func _reveal_in_explorer(paths: Array[String]) -> void:
+	if paths.is_empty():
+		return
+
+	# Group paths by their parent directory
+	var by_dir: Dictionary = {}
+	for p in paths:
+		var d := p.get_base_dir()
+		if not by_dir.has(d):
+			by_dir[d] = []
+		by_dir[d].append(p)
+
+	for dir_key in by_dir.keys():
+		var dir_files: Array = by_dir[dir_key]
+		if OS.get_name() == "Windows":
+			# On Windows use explorer /select for both single and multi-file:
+			# it scrolls the view to the selected file (more reliable than
+			# SHOpenFolderAndSelectItems which can leave the selection off-screen).
+			_windows_select_multiple(dir_key, dir_files)
+		else:
+			OS.shell_show_in_file_manager(dir_files[0])
+
+
+func _windows_select_multiple(folder: String, files: Array) -> void:
+	var win_folder := folder.replace("/", "\\")
+	var esc_folder := win_folder.replace("'", "''")   # PS single-quote escape
+
+	var parts: PackedStringArray = []
+
+	# Step 1: open Explorer and scroll to the first file.
+	# "explorer /select,path" is the most reliable way to both select AND scroll.
+	# We build the /select argument inside PowerShell using [char]34 (double-quote)
+	# to sidestep OS.create_process quoting issues with paths that have spaces.
+	var f0_win := (files[0] as String).replace("/", "\\").replace("'", "''")
+	parts.append(
+		"explorer.exe ('/select,' + [char]34 + '" + f0_win + "' + [char]34)"
+	)
+
+	if files.size() > 1:
+		# Step 2: wait for the Explorer window, then extend the selection.
+		parts.append("Start-Sleep -Milliseconds 1200")
+		parts.append("$sh=New-Object -ComObject Shell.Application")
+		parts.append("$fd=$sh.NameSpace('" + esc_folder + "')")
+		parts.append("if($null -eq $fd){exit}")
+		# Case-insensitive, trailing-backslash-tolerant comparison
+		parts.append("$tgt='" + esc_folder + "'.TrimEnd('\\')")
+		parts.append(
+			"$wnd=$sh.Windows()" +
+			"|Where-Object{try{$_.Document.Folder.Self.Path.TrimEnd('\\') -ieq $tgt}catch{$false}}" +
+			"|Select-Object -First 1"
+		)
+		parts.append("if($null -eq $wnd){exit}")
+		# Re-select first file (flag 1 = select-only, syncs with explorer's own state)
+		var fname0 := (files[0] as String).get_file().replace("'", "''")
+		parts.append(
+			"$it=$fd.ParseName('" + fname0 + "');if($null -ne $it){$wnd.Document.SelectItem($it,1)}"
+		)
+		# Add remaining files (flag 3 = add to existing selection)
+		for i in range(1, files.size()):
+			var fname := (files[i] as String).get_file().replace("'", "''")
+			parts.append(
+				"$it=$fd.ParseName('" + fname + "');if($null -ne $it){$wnd.Document.SelectItem($it,3)}"
+			)
+
+	var cmd := ";".join(parts)
+	OS.create_process("powershell.exe",
+		["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd])
 
 
 func _on_select_project_pressed() -> void:
@@ -1305,6 +1769,7 @@ func _on_select_project_pressed() -> void:
 
 func _on_project_dir_selected(dir: String) -> void:
 	settings.set_setting("last_directory", dir)
+	settings.add_recent_folder(dir)          # ← remember folder in recent list
 	settings.save_settings()
 	file_dialog.current_dir = dir
 
@@ -1318,11 +1783,25 @@ func _on_project_dir_selected(dir: String) -> void:
 	scan_project_models(dir)
 
 
+# Track whether this is a top-level scan call (not a recursive sub-dir call).
+var _scan_depth: int = 0
+
 func scan_project_models(path: String) -> void:
-	print("3DViewModels: scanning models in ", path)
+	_scan_depth += 1
+	if _scan_depth == 1:
+		_set_status("🔍 Сканирование %s..." % path.get_file())
+		if _prog_win:
+			_prog_win.title = "Сканирование"
+		if _prog_stage_label:
+			_prog_stage_label.text = "🔍 Сканирование %s..." % path.get_file()
+		_op_start_msec = Time.get_ticks_msec()
+		_show_progress(5.0)   # threshold not yet reached — window stays hidden for fast scans
+		print("3DViewModels: scanning models in ", path)
+
 	var dir := DirAccess.open(path)
 	if !dir:
 		push_error("Failed to open directory: " + path)
+		_scan_depth -= 1
 		return
 
 	dir.list_dir_begin()
@@ -1339,7 +1818,31 @@ func scan_project_models(path: String) -> void:
 		file_name = dir.get_next()
 	dir.list_dir_end()
 
-	call_deferred("update_model_list", search_box.text if search_box else "")
+	_scan_depth -= 1
+	if _scan_depth == 0:
+		# Deferred so model_paths is fully populated before we read the count.
+		call_deferred("_finish_scan")
+
+
+func _finish_scan() -> void:
+	update_model_list(search_box.text if search_box else "")
+	_set_status("📂 Найдено: %d %s" % [
+		model_paths.size(),
+		_plural_models(model_paths.size())
+	], 6.0)
+	if _prog_win and _prog_win.visible:
+		_show_progress(100.0)
+		await get_tree().create_timer(0.4).timeout
+	_hide_progress()
+
+
+func _plural_models(n: int) -> String:
+	if n % 100 in range(11, 20):
+		return "моделей"
+	match n % 10:
+		1: return "модель"
+		2, 3, 4: return "модели"
+		_: return "моделей"
 
 
 func _get_selected_model_path() -> String:
@@ -1484,6 +1987,244 @@ func _collect_gltf_statistics(gltf_json: Dictionary) -> Dictionary:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  List tabs (All / Favorites)
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_list_tabs() -> void:
+	if not model_list:
+		return
+	# ModelContainer is an HBoxContainer — we must go one level up to the
+	# VBoxContainer (left_panel) so the tabs row sits ABOVE the list, not beside it.
+	var model_container := model_list.get_parent()          # HBoxContainer
+	var left_vbox       := model_container.get_parent()     # VBoxContainer
+
+	var tabs_bar := HBoxContainer.new()
+	tabs_bar.name = "ListTabsBar"
+	tabs_bar.add_theme_constant_override("separation", 0)
+	tabs_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var btn_group := ButtonGroup.new()
+	btn_group.pressed.connect(_on_tab_btn_pressed)
+
+	_tab_all_btn = Button.new()
+	_tab_all_btn.name                    = "TabAllBtn"
+	_tab_all_btn.text                    = "Все"
+	_tab_all_btn.toggle_mode             = true
+	_tab_all_btn.button_pressed          = true
+	_tab_all_btn.button_group            = btn_group
+	_tab_all_btn.size_flags_horizontal   = Control.SIZE_EXPAND_FILL
+	_tab_all_btn.custom_minimum_size     = Vector2(0, 28)
+	_tab_all_btn.clip_text               = true
+
+	_tab_fav_btn = Button.new()
+	_tab_fav_btn.name                    = "TabFavBtn"
+	_tab_fav_btn.text                    = "★ Избранное"
+	_tab_fav_btn.toggle_mode             = true
+	_tab_fav_btn.button_pressed          = false
+	_tab_fav_btn.button_group            = btn_group
+	_tab_fav_btn.size_flags_horizontal   = Control.SIZE_EXPAND_FILL
+	_tab_fav_btn.custom_minimum_size     = Vector2(0, 28)
+	_tab_fav_btn.clip_text               = true
+
+	tabs_bar.add_child(_tab_all_btn)
+	tabs_bar.add_child(_tab_fav_btn)
+
+	# Insert tabs_bar directly above ModelContainer in the VBoxContainer
+	left_vbox.add_child(tabs_bar)
+	left_vbox.move_child(tabs_bar, model_container.get_index())
+
+
+func _on_tab_btn_pressed(btn: BaseButton) -> void:
+	_active_tab = 0 if btn == _tab_all_btn else 1
+	update_model_list(search_box.text if search_box else "")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Status bar
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_status_bar() -> void:
+	if not left_panel:
+		return
+
+	var bg := PanelContainer.new()
+	bg.name = "StatusBarBg"
+	bg.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var panel_style := StyleBoxFlat.new()
+	panel_style.bg_color              = Color(0.10, 0.10, 0.10, 0.85)
+	panel_style.content_margin_left   = 5
+	panel_style.content_margin_right  = 5
+	panel_style.content_margin_top    = 2
+	panel_style.content_margin_bottom = 2
+	bg.add_theme_stylebox_override("panel", panel_style)
+
+	_status_label = Label.new()
+	_status_label.name                  = "StatusLabel"
+	_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_status_label.clip_text             = true
+	_status_label.custom_minimum_size   = Vector2(0, 18)
+	_status_label.vertical_alignment    = VERTICAL_ALIGNMENT_CENTER
+	_status_label.add_theme_font_size_override("font_size", 11)
+	bg.add_child(_status_label)
+
+	left_panel.add_child(bg)   # last → very bottom of left panel
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Progress popup window
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_progress_window() -> void:
+	_prog_win = Window.new()
+	_prog_win.title         = "Прогресс"
+	_prog_win.size          = Vector2i(340, 95)
+	_prog_win.min_size      = Vector2i(340, 95)
+	_prog_win.always_on_top = true
+	_prog_win.transient     = true
+	_prog_win.exclusive     = false
+	_prog_win.visible       = false
+	# Prevent the user from closing it mid-operation
+	_prog_win.close_requested.connect(func() -> void: pass)
+	add_child(_prog_win)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left",   10)
+	margin.add_theme_constant_override("margin_right",  10)
+	margin.add_theme_constant_override("margin_top",     8)
+	margin.add_theme_constant_override("margin_bottom",  8)
+	_prog_win.add_child(margin)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 6)
+	margin.add_child(vbox)
+
+	_prog_stage_label = Label.new()
+	_prog_stage_label.name                  = "StageLabel"
+	_prog_stage_label.clip_text             = true
+	_prog_stage_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_prog_stage_label.add_theme_font_size_override("font_size", 12)
+	vbox.add_child(_prog_stage_label)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	vbox.add_child(row)
+
+	_progress_bar = ProgressBar.new()
+	_progress_bar.name                  = "ProgBar"
+	_progress_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_progress_bar.custom_minimum_size   = Vector2(0, 22)
+	_progress_bar.show_percentage       = false
+	_progress_bar.min_value             = 0.0
+	_progress_bar.max_value             = 100.0
+	_progress_bar.value                 = 0.0
+
+	var fill_sb := StyleBoxFlat.new()
+	fill_sb.bg_color = Color(0.15, 0.60, 1.00)   # bright blue fill
+	_progress_bar.add_theme_stylebox_override("fill", fill_sb)
+
+	var bg_sb := StyleBoxFlat.new()
+	bg_sb.bg_color = Color(0.08, 0.08, 0.10)      # near-black trough
+	_progress_bar.add_theme_stylebox_override("background", bg_sb)
+
+	row.add_child(_progress_bar)
+
+	_prog_pct_label = Label.new()
+	_prog_pct_label.name                  = "PctLabel"
+	_prog_pct_label.text                  = "0%"
+	_prog_pct_label.custom_minimum_size.x = 38
+	_prog_pct_label.horizontal_alignment  = HORIZONTAL_ALIGNMENT_RIGHT
+	_prog_pct_label.vertical_alignment    = VERTICAL_ALIGNMENT_CENTER
+	_prog_pct_label.add_theme_font_size_override("font_size", 12)
+	row.add_child(_prog_pct_label)
+
+
+## Show the progress window and set the bar to `value` (0–100).
+## The window only opens if the operation has already taken longer than
+## PROGRESS_THRESHOLD_MS — fast loads never trigger it.
+func _show_progress(value: float) -> void:
+	if not _prog_win or not _progress_bar:
+		return
+	var clamped := clampf(value, 0.0, 100.0)
+	_progress_bar.value = clamped
+	if _prog_pct_label:
+		_prog_pct_label.text = "%d%%" % int(clamped)
+	# Only open the window once the threshold has been exceeded.
+	if not _prog_win.visible:
+		if Time.get_ticks_msec() - _op_start_msec < PROGRESS_THRESHOLD_MS:
+			return   # still fast — silently update value but don't pop up
+		_prog_win.popup_centered()
+	RenderingServer.force_draw()
+
+
+## Hide the progress window and reset bar to 0%.
+func _hide_progress() -> void:
+	if _progress_bar:
+		_progress_bar.value = 0.0
+	if _prog_pct_label:
+		_prog_pct_label.text = "0%"
+	if _prog_stage_label:
+		_prog_stage_label.text = ""
+	if _prog_win:
+		_prog_win.hide()
+
+
+## Show `text` in the status bar.
+## Pass auto_clear_sec > 0 to auto-erase the message after that many seconds.
+## Pass 0 to keep the message until the next _set_status call.
+func _set_status(text: String, auto_clear_sec: float = 0.0) -> void:
+	if not _status_label:
+		return
+	_status_label.text = text
+	if auto_clear_sec > 0.0:
+		var snap := text   # capture for closure
+		get_tree().create_timer(auto_clear_sec).timeout.connect(
+			func() -> void:
+				if _status_label and _status_label.text == snap:
+					_status_label.text = ""
+		, CONNECT_ONE_SHOT)
+
+
+## Receives stage text emitted by view_model during loading.
+## Maps each stage keyword to a progress percentage and forces a visual refresh.
+func _on_loading_stage(text: String) -> void:
+	if not _status_label:
+		return
+	if text.is_empty():
+		# Empty = loading finished; the caller sets the final status text.
+		_show_progress(100.0)
+		RenderingServer.force_draw()
+		return
+
+	_status_label.text = text
+	if _prog_stage_label:
+		_prog_stage_label.text = text
+
+	# Map known stage prefixes to progress percentages.
+	var pct: float
+	if   text.begins_with("Очистка"):    pct =  5.0
+	elif text.begins_with("Чтение"):     pct = 25.0
+	elif text.begins_with("Добавление"): pct = 55.0
+	elif text.begins_with("Настройка"):  pct = 82.0
+	elif text.begins_with("Построение"): pct = 93.0
+	elif text.begins_with("Ошибка"):     pct = 100.0
+	else:                                pct = 50.0
+
+	# _show_progress calls force_draw() internally; no extra call needed.
+	_show_progress(pct)
+
+
+# ── Favorites helpers ─────────────────────────────────────────────────────────
+func _modify_favorites(paths: Array[String], add: bool) -> void:
+	var favs: Array = settings.get_favorites()
+	for p in paths:
+		if add:
+			if p not in favs:
+				favs.append(p)
+		else:
+			favs.erase(p)
+	settings.set_favorites(favs)
+	update_model_list(search_box.text if search_box else "")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Model list
 # ══════════════════════════════════════════════════════════════════════════════
 func _on_search_text_changed(new_text: String) -> void:
@@ -1496,19 +2237,37 @@ func update_model_list(search_text: String = "") -> void:
 	model_list.clear()
 	filtered_model_paths.clear()
 
-	var filter := search_text.to_lower()
-	for path in model_paths:
+	var filter  := search_text.to_lower()
+	var favs: Array = settings.get_favorites()
+
+	# Build source list depending on active tab.
+	# Favorites tab shows ALL saved favorites that still exist on disk —
+	# independent of the currently scanned directory.
+	var source: Array = model_paths
+	if _active_tab == 1:
+		source = []
+		for p: String in favs:
+			if FileAccess.file_exists(p):
+				source.append(p)
+
+	for path: String in source:
 		var file_name := path.get_file().to_lower()
-		if filter.is_empty() or file_name.contains(filter):
-			filtered_model_paths.append(path)
-			var item_index := model_list.add_item(path.get_file())
-			model_list.set_item_tooltip(item_index, path)
-			# Show cached thumbnail or a colored format-placeholder icon
-			var icon: ImageTexture = _thumb_cache.get(path, null) as ImageTexture
-			if !icon:
-				icon = _get_format_icon(path.get_extension())
-			if icon:
-				model_list.set_item_icon(item_index, icon)
+		if not filter.is_empty() and not file_name.contains(filter):
+			continue
+		filtered_model_paths.append(path)
+
+		# In "All" tab mark favourite items with a star prefix.
+		var display_name := path.get_file()
+		if _active_tab == 0 and path in favs:
+			display_name = "★ " + display_name
+
+		var item_index := model_list.add_item(display_name)
+		model_list.set_item_tooltip(item_index, path)
+		var icon: ImageTexture = _thumb_cache.get(path, null) as ImageTexture
+		if not icon:
+			icon = _get_format_icon(path.get_extension())
+		if icon:
+			model_list.set_item_icon(item_index, icon)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1675,28 +2434,55 @@ func _create_recent_button() -> void:
 	recent_btn.custom_minimum_size.y   = 28
 	recent_btn.flat                    = false
 
+	# Rebuild popup every time it opens so it always shows current data.
+	# IDs: folders use IDs 0..99, models use IDs 100..199.
 	recent_btn.about_to_popup.connect(func():
-		var popup := recent_btn.get_popup()
+		var popup   := recent_btn.get_popup()
 		popup.clear()
-		var recent: Array = settings.get_recent_models()
-		if recent.is_empty():
-			popup.add_item("Нет недавних моделей", 0)
+
+		var folders: Array = settings.get_recent_folders()
+		var models:  Array = settings.get_recent_models()
+
+		# ── Folders ──
+		if not folders.is_empty():
+			for i: int in folders.size():
+				var label := "📁 " + str(folders[i]).rstrip("/\\").get_file()
+				popup.add_item(label, i)          # ID = i  (0-based)
+				popup.set_item_tooltip(popup.item_count - 1, str(folders[i]))
+
+		# ── Separator ──
+		if not folders.is_empty() and not models.is_empty():
+			popup.add_separator("Модели")
+
+		# ── Models ──
+		if not models.is_empty():
+			for i: int in models.size():
+				popup.add_item(str(models[i]).get_file(), 100 + i)  # ID = 100+i
+				popup.set_item_tooltip(popup.item_count - 1, str(models[i]))
+
+		# ── Nothing at all ──
+		if folders.is_empty() and models.is_empty():
+			popup.add_item("Нет недавних", 0)
 			popup.set_item_disabled(0, true)
-		else:
-			for i: int in recent.size():
-				popup.add_item(str(recent[i]).get_file(), i)
-				popup.set_item_tooltip(i, str(recent[i]))
 	)
 
-	recent_btn.get_popup().index_pressed.connect(func(idx: int):
-		var recent: Array = settings.get_recent_models()
-		if idx >= recent.size():
-			return
-		var path := str(recent[idx])
-		if FileAccess.file_exists(path):
-			_load_model_directly(path)
+	# Use IDs (not indices) so the separator row doesn't throw off the lookup.
+	recent_btn.get_popup().id_pressed.connect(func(id: int):
+		if id < 100:
+			# ── Folder item ──
+			var folders: Array = settings.get_recent_folders()
+			if id < folders.size():
+				_on_project_dir_selected(str(folders[id]))
 		else:
-			_show_message("Ошибка", "Файл не найден:\n" + path)
+			# ── Model item ──
+			var models: Array = settings.get_recent_models()
+			var m_idx  := id - 100
+			if m_idx < models.size():
+				var path := str(models[m_idx])
+				if FileAccess.file_exists(path):
+					_load_model_directly(path)
+				else:
+					_show_message("Ошибка", "Файл не найден:\n" + path)
 	)
 
 	left_panel.add_child(recent_btn)
@@ -1710,6 +2496,7 @@ func _load_model_directly(path: String) -> void:
 	var idx := filtered_model_paths.find(path)
 	if idx != -1:
 		model_list.select(idx)
+		model_list.call_deferred("scroll_to_item", idx)
 		_on_model_selected(idx)
 
 
@@ -1760,6 +2547,14 @@ func _get_toolbar_btn(btn_name: String) -> Button:
 	return toolbar.get_node_or_null(btn_name) as Button
 
 
+func _update_wireframe_btn_text() -> void:
+	var btn := _get_toolbar_btn("WireframeToggleBtn")
+	if !btn or !viewport_container:
+		return
+	var labels := ["Каркас", "Поверх▪", "Каркас■"]
+	btn.text = labels[viewport_container.wireframe_mode]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Drag & Drop (OS file drop)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1799,6 +2594,7 @@ func _on_files_dropped(files: PackedStringArray) -> void:
 		var first_index := filtered_model_paths.find(models[0])
 		if first_index != -1:
 			model_list.select(first_index)
+			model_list.call_deferred("scroll_to_item", first_index)
 			_on_model_selected(first_index)
 		return
 

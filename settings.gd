@@ -22,7 +22,9 @@ const DEFAULT_SETTINGS := {
 	"animation_playing": false,
 	"current_animation": "",
 	"animation_position": 0.0,
-	"recent_models": "[]"
+	"recent_models": "[]",
+	"recent_folders": "[]",
+	"favorites": "[]"
 }
 
 var config := ConfigFile.new()
@@ -125,3 +127,50 @@ func add_recent_model(path: String, max_count: int = 10) -> void:
 	while recent.size() > max_count:
 		recent.pop_back()
 	set_setting("recent_models", JSON.stringify(recent))
+
+
+# ── Recent folders ────────────────────────────────────────────────────────────
+func get_recent_folders() -> Array:
+	var parsed: Variant = JSON.parse_string(str(get_setting("recent_folders")))
+	if typeof(parsed) != TYPE_ARRAY:
+		return []
+	return parsed
+
+
+func add_recent_folder(path: String, max_count: int = 8) -> void:
+	var folders: Array = get_recent_folders()
+	folders.erase(path)
+	folders.insert(0, path)
+	while folders.size() > max_count:
+		folders.pop_back()
+	set_setting("recent_folders", JSON.stringify(folders))
+
+
+# ── Favorites ──────────────────────────────────────────────────────────────────
+func get_favorites() -> Array:
+	var parsed: Variant = JSON.parse_string(str(get_setting("favorites")))
+	if typeof(parsed) != TYPE_ARRAY:
+		return []
+	return parsed
+
+
+func set_favorites(favs: Array) -> void:
+	set_setting("favorites", JSON.stringify(favs))
+
+
+func is_favorite(path: String) -> bool:
+	return path in get_favorites()
+
+
+func add_favorite(path: String) -> void:
+	var favs: Array = get_favorites()
+	if path not in favs:
+		favs.append(path)
+		set_favorites(favs)
+
+
+func remove_favorite(path: String) -> void:
+	var favs: Array = get_favorites()
+	if path in favs:
+		favs.erase(path)
+		set_favorites(favs)

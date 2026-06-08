@@ -1,6 +1,9 @@
 extends SubViewportContainer
 class_name PreviewModel
 
+## Emitted at each major stage of model loading so the UI can show progress.
+signal loading_stage(text: String)
+
 @onready var preview_viewport = $SubViewport
 @onready var preview_camera = $SubViewport/Camera3D
 @onready var play_pause_button = get_node("../HSplitContainer_ControlsRow/PlayPauseButton")
@@ -17,6 +20,12 @@ const GLTF_CACHE_DIR := "user://gltf_cache"
 const GLTF_TEXTURE_EXTENSIONS := ["png", "jpg", "jpeg", "webp", "bmp", "tga", "hdr", "exr"]
 const FALLBACK_PNG_BASE64 := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 const FALLBACK_TEXTURE_FILE_NAME := "__missing_gltf_texture.png"
+
+const WIREFRAME_SHADER_SRC := \
+"shader_type spatial;\n" + \
+"render_mode wireframe, unshaded, cull_disabled;\n" + \
+"uniform vec4 wire_color : source_color = vec4(0.05, 0.9, 0.4, 1.0);\n" + \
+"void fragment() { ALBEDO = wire_color.rgb; }"
 
 class MTLMaterial:
 	var name: String
@@ -78,6 +87,9 @@ var _gizmo_overlay: Control        = null
 var gizmo_visible:  bool           = true
 
 var wireframe_enabled:     bool         = false
+var wireframe_mode:        int          = 0   # 0 = off, 1 = overlay, 2 = wireframe-only
+var _wireframe_overlay_nodes: Array     = []
+var _isolated_mesh_name:   String       = ""
 var zoom_to_cursor:        bool         = true
 var animation_speed_scale: float        = 1.0
 var _speed_option_btn:     OptionButton = null
@@ -223,9 +235,9 @@ func _on_timeline_changed(value: float):
 func _process(delta: float) -> void:
 	# FPS/draw-calls overlay — runs even without a loaded model
 	if _fps_visible and _fps_label:
-		var fps: int = Engine.get_frames_per_second()
-		var draws: int = RenderingServer.get_rendering_info(
-				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
+		var fps:   int = int(Engine.get_frames_per_second())
+		var draws: int = int(RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME))
 		_fps_label.text = "FPS: %d\nDraw calls: %d" % [fps, draws]
 
 	# ── Sync timeline slider with animation playback position ────────────────
@@ -369,18 +381,24 @@ func _get_aabb_max_axis(aabb: AABB) -> float:
 
 
 func load_in_preview_portal(model_path: String) -> String:
+	loading_stage.emit("Очистка сцены...")
 	clear_model()
-	
+
+	var ext := model_path.get_extension().to_upper()
+	loading_stage.emit("Чтение %s — %s..." % [ext, model_path.get_file()])
 	var model = load_model_from_path(model_path)
 	if !model:
+		loading_stage.emit("Ошибка загрузки")
 		print("Failed to load model")
 		return "Ошибка загрузки модели"
 
+	loading_stage.emit("Добавление в сцену...")
 	current_model = model
 	preview_viewport.add_child(current_model)
-	
+
 	current_model.transform = Transform3D.IDENTITY
 
+	loading_stage.emit("Настройка камеры...")
 	var aabb_info := _get_model_aabb(current_model)
 	if bool(aabb_info["has_mesh"]):
 		var total_aabb: AABB = aabb_info["aabb"]
@@ -417,13 +435,23 @@ func load_in_preview_portal(model_path: String) -> String:
 		var max_distance: float = maxf(model_extent * 10.0, min_distance + 1.0)
 		camera_distance = clamp(camera_distance, min_distance, max_distance)
 		update_camera_position()
-	
+
 	if owner and owner.settings:
 		owner.settings.set_setting("auto_rotation", is_rotating)
 		owner.settings.set_setting("rotation_speed", auto_rotation_speed)
 		owner.settings.set_setting("camera_distance", camera_distance)
 
 	_update_grid()
+
+	# Restore wireframe mode for newly loaded model
+	if wireframe_mode == 1:
+		loading_stage.emit("Построение wireframe...")
+		_build_wireframe_overlay()
+	elif wireframe_mode == 2:
+		if preview_viewport:
+			preview_viewport.debug_draw = Viewport.DEBUG_DRAW_WIREFRAME
+
+	loading_stage.emit("")   # clear — caller sets the "done" message
 	return "Модель загружена успешно"
 
 func load_mtl_file(mtl_path: String) -> Dictionary:
@@ -1147,9 +1175,11 @@ func _convert_importer_meshes(root: Node) -> void:
 	var all_nodes: Array = _get_all_children(root)
 
 	for node in all_nodes:
-		if node.get_class() != "ImporterMeshInstance3D":
-			continue
+		# Check validity FIRST — node.free() in a previous iteration may have
+		# recursively freed child nodes that are also in this snapshot array.
 		if !is_instance_valid(node):
+			continue
+		if node.get_class() != "ImporterMeshInstance3D":
 			continue
 
 		# ImporterMeshInstance3D.mesh → ImporterMesh → get_mesh() → ArrayMesh
@@ -1423,6 +1453,10 @@ func clear_model():
 		timeline_slider.value   = 0.0
 	if _grid_instance:
 		_grid_instance.visible = false
+	# Reset wireframe overlay and mesh isolation before freeing model
+	_remove_wireframe_overlay()
+	_isolated_mesh_name = ""
+
 	if current_model:
 		for child in _get_all_children(current_model):
 			if child is MeshInstance3D:
@@ -1436,9 +1470,9 @@ func clear_model():
 							surface_mat.metallic_texture = null
 							surface_mat.roughness_texture = null
 							mesh.surface_set_material(i, null)
-				
+
 				child.mesh = null
-		
+
 		current_model.queue_free()
 		current_model = null
 
@@ -1552,6 +1586,7 @@ func get_model_details() -> Dictionary:
 		"materials_data": [],
 		"textures_data":  [],
 		"animations_data":[],
+		"meshes_data":    [],
 		"aabb_size":      Vector3.ZERO,
 		"vertices":       "0",
 		"faces":          "0",
@@ -1570,8 +1605,18 @@ func get_model_details() -> Dictionary:
 		if not child is MeshInstance3D:
 			continue
 		var mi := child as MeshInstance3D
+		# Skip the wireframe overlay duplicates
+		if mi.get_meta("_wf_overlay", false):
+			continue
 		if !mi.mesh:
 			continue
+
+		# Prefer the mesh-resource name; fall back to the node name
+		var _mesh_display: String = mi.name
+		if mi.mesh and not mi.mesh.resource_name.is_empty():
+			_mesh_display = mi.mesh.resource_name
+		details.meshes_data.append({"name": mi.name, "display": _mesh_display})
+
 		var mesh: Mesh = mi.mesh
 
 		for surface_idx in range(mesh.get_surface_count()):
@@ -1582,9 +1627,9 @@ func get_model_details() -> Dictionary:
 				vertex_count += verts.size()
 				if arrays[Mesh.ARRAY_INDEX] is PackedInt32Array:
 					var idx_arr := arrays[Mesh.ARRAY_INDEX] as PackedInt32Array
-					face_count += idx_arr.size() / 3
+					face_count += int(idx_arr.size() / 3.0)
 				else:
-					face_count += verts.size() / 3
+					face_count += int(verts.size() / 3.0)
 
 			# ── material info ────────────────────────────────────────────
 			var surface_material: Material = mesh.surface_get_material(surface_idx)
@@ -2060,13 +2105,13 @@ func fit_to_view() -> void:
 
 
 ## Capture the current viewport as a thumbnail of the given pixel size.
-func capture_thumbnail(size: Vector2i) -> ImageTexture:
+func capture_thumbnail(thumb_size: Vector2i) -> ImageTexture:
 	if !preview_viewport:
 		return null
 	var img: Image = preview_viewport.get_texture().get_image()
 	if !img or img.is_empty():
 		return null
-	img.resize(size.x, size.y, Image.INTERPOLATE_BILINEAR)
+	img.resize(thumb_size.x, thumb_size.y, Image.INTERPOLATE_BILINEAR)
 	return ImageTexture.create_from_image(img)
 
 
@@ -2210,14 +2255,125 @@ func _on_gizmo_draw() -> void:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Wireframe
+#  Wireframe  (0 = off | 1 = overlay solid+wire | 2 = wireframe-only)
 # ══════════════════════════════════════════════════════════════════════════════
 func toggle_wireframe() -> void:
-	wireframe_enabled = !wireframe_enabled
-	if preview_viewport:
-		preview_viewport.debug_draw = \
-			Viewport.DEBUG_DRAW_WIREFRAME if wireframe_enabled \
-			else Viewport.DEBUG_DRAW_DISABLED
+	set_wireframe_mode((wireframe_mode + 1) % 3)
+
+
+func set_wireframe_mode(mode: int) -> void:
+	wireframe_mode    = mode
+	wireframe_enabled = (mode == 2)
+	match mode:
+		0:  # Solid only — remove overlay, restore normal draw
+			_remove_wireframe_overlay()
+			if preview_viewport:
+				preview_viewport.debug_draw = Viewport.DEBUG_DRAW_DISABLED
+		1:  # Overlay — solid rendered normally, wireframe mesh on top
+			if preview_viewport:
+				preview_viewport.debug_draw = Viewport.DEBUG_DRAW_DISABLED
+			_build_wireframe_overlay()
+		2:  # Wireframe only via viewport debug draw
+			_remove_wireframe_overlay()
+			if preview_viewport:
+				preview_viewport.debug_draw = Viewport.DEBUG_DRAW_WIREFRAME
+
+
+func _build_wireframe_overlay() -> void:
+	_remove_wireframe_overlay()
+	if !current_model:
+		return
+
+	# ── Pass 1: collect all real mesh instances iteratively (BFS, no recursion) ──
+	var real_meshes: Array[MeshInstance3D] = []
+	var queue: Array[Node] = [current_model]
+	while queue.size() > 0:
+		var n: Node = queue.pop_front()
+		if n is MeshInstance3D:
+			var mi := n as MeshInstance3D
+			if !mi.get_meta("_wf_overlay", false) and mi.mesh:
+				real_meshes.append(mi)
+		# Only queue children that existed before we added any duplicates
+		for c in n.get_children():
+			if not c.get_meta("_wf_overlay", false):
+				queue.append(c)
+
+	# ── Pass 2: create wireframe duplicates now that the list is frozen ──────────
+	var wf_shader := Shader.new()
+	wf_shader.code = WIREFRAME_SHADER_SRC
+	var wf_mat := ShaderMaterial.new()
+	wf_mat.shader = wf_shader
+
+	for mi in real_meshes:
+		var dup := MeshInstance3D.new()
+		dup.set_meta("_wf_overlay", true)
+		dup.mesh = mi.mesh
+		dup.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		for s in range(mi.mesh.get_surface_count()):
+			dup.set_surface_override_material(s, wf_mat)
+		mi.add_child(dup)
+		_wireframe_overlay_nodes.append(dup)
+
+
+func _remove_wireframe_overlay() -> void:
+	for node in _wireframe_overlay_nodes:
+		if is_instance_valid(node):
+			node.queue_free()
+	_wireframe_overlay_nodes.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Mesh isolation — click a mesh name to hide all others; click again to restore
+# ══════════════════════════════════════════════════════════════════════════════
+func isolate_mesh(mesh_name: String) -> void:
+	if !current_model:
+		return
+	if _isolated_mesh_name == mesh_name:
+		show_all_meshes()
+		return
+	_isolated_mesh_name = mesh_name
+	for child in _get_all_children(current_model):
+		if child is MeshInstance3D and not child.get_meta("_wf_overlay", false):
+			child.visible = (child.name == mesh_name)
+
+
+func show_all_meshes() -> void:
+	_isolated_mesh_name = ""
+	if !current_model:
+		return
+	for child in _get_all_children(current_model):
+		if child is MeshInstance3D and not child.get_meta("_wf_overlay", false):
+			child.visible = true
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Associated file paths (textures / materials) for the loaded model
+# ══════════════════════════════════════════════════════════════════════════════
+func get_texture_file_paths() -> Array[String]:
+	var paths: Array[String] = []
+	if !current_model:
+		return paths
+	for child in _get_all_children(current_model):
+		if not child is MeshInstance3D:
+			continue
+		var mi := child as MeshInstance3D
+		if !mi.mesh:
+			continue
+		for s in range(mi.mesh.get_surface_count()):
+			var mat: Material = mi.mesh.surface_get_material(s)
+			if not mat is StandardMaterial3D:
+				continue
+			var sm := mat as StandardMaterial3D
+			for tex: Texture2D in [
+					sm.albedo_texture,   sm.normal_texture,
+					sm.metallic_texture, sm.roughness_texture,
+					sm.emission_texture, sm.ao_texture]:
+				if not tex or tex.resource_path.is_empty():
+					continue
+				var abs_path := ProjectSettings.globalize_path(tex.resource_path)
+				if FileAccess.file_exists(abs_path) and abs_path not in paths:
+					paths.append(abs_path)
+	return paths
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -15,9 +15,11 @@ var dimensions_label: Label = null
 var materials_container: VBoxContainer = null
 var textures_container: VBoxContainer = null
 var animations_container: VBoxContainer = null
+var meshes_container: VBoxContainer = null
 
 var current_material_preview: Window = null
 var animation_player: AnimationPlayer = null
+var _current_model_path: String = ""
 
 
 func _ready() -> void:
@@ -34,6 +36,8 @@ func _ready() -> void:
 		return
 
 	_create_dimensions_label()
+	_create_path_copy_button()
+	_create_meshes_section()
 	setup_ui()
 	clear_info()
 
@@ -42,6 +46,7 @@ func _ensure_responsive_scroll_layout() -> void:
 	custom_minimum_size = Vector2(0, 0)
 	size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
+	clip_contents = true   # panel itself never draws outside its rect
 
 	var legacy_vbox: VBoxContainer = get_node_or_null("VBoxContainer") as VBoxContainer
 	var existing_scroll: ScrollContainer = get_node_or_null("ScrollContainer") as ScrollContainer
@@ -105,7 +110,7 @@ func setup_ui() -> void:
 				path_label]:
 		_setup_wrapping_label(lbl)
 
-	for container in [materials_container, textures_container, animations_container]:
+	for container in [materials_container, textures_container, animations_container, meshes_container]:
 		if container:
 			container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 			container.size_flags_vertical   = Control.SIZE_EXPAND_FILL
@@ -123,6 +128,7 @@ func update_info(model_info: Dictionary) -> void:
 		clear_info()
 		return
 
+	_current_model_path = str(model_info.get("path", ""))
 	file_name_label.text = "Файл: " + str(model_info.get("filename", "Неизвестно"))
 	type_label.text = "Тип: " + str(model_info.get("type", "Неизвестно"))
 	size_label.text = "Размер: " + str(model_info.get("size", "Неизвестно"))
@@ -130,7 +136,7 @@ func update_info(model_info: Dictionary) -> void:
 	vertices_label.text = "Вершин: " + str(model_info.get("vertices", "Неизвестно"))
 	faces_label.text = "Граней: " + str(model_info.get("faces", "Неизвестно"))
 	materials_label.text = "Материалов: " + str(model_info.get("materials", "Неизвестно"))
-	path_label.text = "Путь: " + str(model_info.get("path", "Неизвестно"))
+	path_label.text = "Путь: " + _current_model_path
 
 	var aabb_sz: Vector3 = model_info.get("aabb_size", Vector3.ZERO)
 	if dimensions_label:
@@ -142,6 +148,7 @@ func update_info(model_info: Dictionary) -> void:
 	update_materials_list(model_info.get("materials_data", []))
 	update_textures_list(model_info.get("textures_data", []))
 	update_animations_list(model_info.get("animations_data", []))
+	update_meshes_list(model_info.get("meshes_data", []))
 
 
 func update_materials_list(materials_data: Array) -> void:
@@ -153,9 +160,10 @@ func update_materials_list(materials_data: Array) -> void:
 	for material_info in materials_data:
 		var item := Button.new()
 		item.text = str(material_info.get("name", "Unnamed Material"))
-		item.custom_minimum_size.y = 30
+		item.custom_minimum_size = Vector2(0, 30)
 		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		item.tooltip_text = str(material_info.get("type", "Material"))
+		item.clip_text = true
+		item.tooltip_text = str(material_info.get("name", "")) + "\n" + str(material_info.get("type", "Material"))
 		item.pressed.connect(_on_material_pressed.bind(material_info))
 		materials_container.add_child(item)
 
@@ -169,8 +177,10 @@ func update_textures_list(textures_data: Array) -> void:
 	for texture_info in textures_data:
 		var item := Button.new()
 		item.text = str(texture_info.get("name", "Unnamed Texture"))
-		item.custom_minimum_size.y = 30
+		item.custom_minimum_size = Vector2(0, 30)
 		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		item.clip_text = true
+		item.tooltip_text = str(texture_info.get("name", ""))
 		item.pressed.connect(_on_texture_pressed.bind(texture_info))
 		textures_container.add_child(item)
 
@@ -187,8 +197,10 @@ func update_animations_list(animations_data: Array) -> void:
 		if animation_info.has("length"):
 			length_text = " (%.2fs)" % float(animation_info["length"])
 		item.text = str(animation_info.get("name", "Unnamed Animation")) + length_text
-		item.custom_minimum_size.y = 30
+		item.custom_minimum_size = Vector2(0, 30)
 		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		item.clip_text = true
+		item.tooltip_text = str(animation_info.get("name", "")) + length_text
 		item.pressed.connect(_on_animation_pressed.bind(animation_info))
 		animations_container.add_child(item)
 
@@ -236,10 +248,10 @@ func _on_texture_pressed(texture_info: Dictionary) -> void:
 	if tex:
 		var tw := float(tex.get_width())
 		var th := float(tex.get_height())
-		var scale := minf(max_w / tw, max_h / th)
-		if scale < 1.0:
-			win_w = tw * scale
-			win_h = th * scale
+		var tex_scale := minf(max_w / tw, max_h / th)
+		if tex_scale < 1.0:
+			win_w = tw * tex_scale
+			win_h = th * tex_scale
 		else:
 			win_w = tw
 			win_h = th
@@ -325,15 +337,18 @@ func clear_info() -> void:
 		materials_label.text = "Материалов: -"
 	if dimensions_label:
 		dimensions_label.text = "Размеры: -"
+	_current_model_path = ""
 	if path_label:
 		path_label.text = "Путь: -"
 
 	_clear_container(materials_container)
 	_clear_container(textures_container)
 	_clear_container(animations_container)
+	_clear_container(meshes_container)
 	_add_empty_label(materials_container, "Нет материалов")
 	_add_empty_label(textures_container, "Нет текстур")
 	_add_empty_label(animations_container, "Нет анимаций")
+	_add_empty_label(meshes_container, "Нет мешей")
 
 	_close_material_preview()
 
@@ -376,3 +391,102 @@ func _create_close_button(window_ref: Window) -> Button:
 			current_material_preview = null
 	)
 	return close_button
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Meshes section (created at runtime so no scene change needed)
+# ══════════════════════════════════════════════════════════════════════════════
+func _create_path_copy_button() -> void:
+	if !path_label or !content_root:
+		return
+
+	var copy_btn := Button.new()
+	copy_btn.name               = "PathCopyBtn"
+	copy_btn.text               = "📋  Скопировать путь"
+	copy_btn.custom_minimum_size = Vector2(0, 26)
+	copy_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	copy_btn.clip_text          = true
+	copy_btn.pressed.connect(func() -> void:
+		if _current_model_path.is_empty():
+			return
+		DisplayServer.clipboard_set(_current_model_path)
+		copy_btn.text = "✓  Скопировано!"
+		get_tree().create_timer(1.5).timeout.connect(func() -> void:
+			if is_instance_valid(copy_btn):
+				copy_btn.text = "📋  Скопировать путь"
+		, CONNECT_ONE_SHOT)
+	)
+	content_root.add_child(copy_btn)
+	# Place directly after PathLabel
+	if path_label.get_parent() == content_root:
+		content_root.move_child(copy_btn, path_label.get_index() + 1)
+
+
+func _create_meshes_section() -> void:
+	if !content_root:
+		return
+
+	var section := VBoxContainer.new()
+	section.name = "MeshesSection"
+	section.add_theme_constant_override("separation", 4)
+	section.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var header := Label.new()
+	header.text = "Меши"
+	header.add_theme_font_size_override("font_size", 13)
+	section.add_child(header)
+
+	var sep := HSeparator.new()
+	section.add_child(sep)
+
+	var list := VBoxContainer.new()
+	list.name = "MeshesList"
+	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	section.add_child(list)
+
+	meshes_container = list
+	content_root.add_child(section)
+
+	# Place right before AnimationsSection if it exists
+	var anim_section := content_root.get_node_or_null("AnimationsSection")
+	if anim_section:
+		content_root.move_child(section, anim_section.get_index())
+
+
+func update_meshes_list(meshes_data: Array) -> void:
+	_clear_container(meshes_container)
+	if meshes_data.is_empty():
+		_add_empty_label(meshes_container, "Нет мешей")
+		return
+
+	for mesh_info in meshes_data:
+		var node_name    := str(mesh_info.get("name",    "Unnamed Mesh"))
+		var display_name := str(mesh_info.get("display", node_name))
+		var item := Button.new()
+		item.text = display_name
+		item.custom_minimum_size = Vector2(0, 28)
+		item.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		item.clip_text = true
+		item.toggle_mode = true
+		item.tooltip_text = display_name + "\nКлик — изолировать (повторный — показать все)"
+		item.toggled.connect(func(_pressed: bool):
+			_on_mesh_isolation_pressed(node_name)
+		)
+		meshes_container.add_child(item)
+
+
+func _on_mesh_isolation_pressed(mesh_name: String) -> void:
+	var viewport := get_node_or_null("../../VBoxContainer2/SubViewportContainer")
+	if viewport and viewport.has_method("isolate_mesh"):
+		viewport.isolate_mesh(mesh_name)
+		var isolated: String = str(viewport.get("_isolated_mesh_name") if viewport.get("_isolated_mesh_name") != null else "")
+		_sync_isolation_buttons(isolated)
+
+
+func _sync_isolation_buttons(isolated_name: String) -> void:
+	if !meshes_container:
+		return
+	for child in meshes_container.get_children():
+		if child is Button:
+			# Use set_pressed_no_signal to avoid re-triggering the toggled callback
+			child.set_pressed_no_signal(isolated_name != "" and child.text == isolated_name)
