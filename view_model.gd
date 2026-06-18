@@ -74,10 +74,20 @@ var camera_pan_speed := 2.0
 var middle_mouse_pressed := false
 var zoom_speed := 1.2
 
+var _orbit_velocity: Vector2       = Vector2.ZERO
+var _last_orbit_delta: Vector2     = Vector2.ZERO
+var _right_mouse_pressed: bool     = false
+var _free_rot_velocity: Vector2    = Vector2.ZERO
+var _last_free_delta: Vector2      = Vector2.ZERO
+var _model_initial_basis: Basis    = Basis.IDENTITY
+var _pan_velocity: Vector2         = Vector2.ZERO
+var _last_pan_delta: Vector2       = Vector2.ZERO
+
 var current_animation_player: AnimationPlayer = null
 var current_animation: String = ""
 var is_playing: bool = false
 var _timeline_updating: bool = false   # prevents seek() feedback loop
+var _anim_reset_gen: int = 0           # incremented on each play/finish; used to cancel pending resets
 
 enum ViewPreset { FRONT = 0, BACK = 1, LEFT = 2, RIGHT = 3, TOP = 4, BOTTOM = 5 }
 
@@ -89,9 +99,24 @@ var gizmo_visible:  bool           = true
 var wireframe_enabled:     bool         = false
 var wireframe_mode:        int          = 0   # 0 = off, 1 = overlay, 2 = wireframe-only
 var _wireframe_overlay_nodes: Array     = []
-var _isolated_mesh_name:   String       = ""
-var zoom_to_cursor:        bool         = true
-var animation_speed_scale: float        = 1.0
+var _isolated_mesh_name:      String       = ""
+var zoom_to_cursor:           bool         = false
+var _missing_textures:        Array[String] = []
+var _extra_texture_dirs:      Array[String] = []
+var animation_speed_scale:    float        = 1.0
+var _orbit_sensitivity:       float        = 0.003
+var _free_rot_sensitivity:    float        = 0.003
+var _inertia_enabled:         bool         = false
+var _pose_reset_delay:        float        = 1.0
+
+# ── Async (threaded) model loading ────────────────────────────────────────────
+var _async_thread: Thread = null
+var _async_result           = null   # Node3D produced by background thread
+
+# ── Model node cache (keeps loaded nodes alive between switches) ───────────────
+var _model_cache_limit: int = 8     # how many models to keep in memory
+var _model_cache:        Dictionary = {}   # path → Node3D
+var _current_model_path: String     = ""  # path of the model currently in viewport
 var _speed_option_btn:     OptionButton = null
 
 # ── Environment & light runtime references ────────────────────────────────────
@@ -255,7 +280,38 @@ func _process(delta: float) -> void:
 	if is_rotating and !dragging and !middle_mouse_pressed:
 		camera_horizontal_angle += delta * auto_rotation_speed
 		update_camera_position()
-	
+
+	# Orbit inertia
+	if not is_dragging and _orbit_velocity.length_squared() > 1e-6:
+		camera_horizontal_angle -= _orbit_velocity.x * delta
+		camera_vertical_angle = clamp(
+			camera_vertical_angle - _orbit_velocity.y * delta,
+			0.1, PI - 0.1
+		)
+		_orbit_velocity *= pow(0.04, delta)
+		if _orbit_velocity.length_squared() < 1e-6:
+			_orbit_velocity = Vector2.ZERO
+		update_camera_position()
+
+	# Free-rotation inertia (RMB)
+	if not _right_mouse_pressed and current_model and _free_rot_velocity.length_squared() > 1e-6:
+		var cb: Basis = preview_camera.global_transform.basis
+		current_model.rotate(Vector3.UP,   -_free_rot_velocity.x * delta)
+		current_model.rotate(cb.x,         -_free_rot_velocity.y * delta)
+		_free_rot_velocity *= pow(0.04, delta)
+		if _free_rot_velocity.length_squared() < 1e-6:
+			_free_rot_velocity = Vector2.ZERO
+
+	# Pan inertia (MMB)
+	if not middle_mouse_pressed and _pan_velocity.length_squared() > 0.01:
+		var cb: Basis = preview_camera.global_transform.basis
+		orbit_center -= cb.x * _pan_velocity.x * camera_pan_speed * 0.01 * delta
+		orbit_center += cb.y * _pan_velocity.y * camera_pan_speed * 0.01 * delta
+		_pan_velocity *= pow(0.04, delta)
+		if _pan_velocity.length_squared() < 0.01:
+			_pan_velocity = Vector2.ZERO
+		update_camera_position()
+
 	var move_vec := Vector3.ZERO
 	
 	if Input.is_action_pressed("camera_forward"):
@@ -331,8 +387,20 @@ func load_saved_settings() -> void:
 	is_rotating = owner.settings.get_setting("auto_rotation")
 	auto_rotation_speed = owner.settings.get_setting("rotation_speed")
 	initial_auto_rotation_speed = auto_rotation_speed
+	apply_viewer_settings(owner.settings)
 	saved_settings_loaded = true
 	update_camera_position()
+
+
+func apply_viewer_settings(sett) -> void:
+	_orbit_sensitivity    = float(sett.get_setting("orbit_sensitivity"))
+	_free_rot_sensitivity = float(sett.get_setting("free_rotation_sensitivity"))
+	zoom_speed            = float(sett.get_setting("zoom_speed"))
+	camera_pan_speed      = float(sett.get_setting("pan_speed"))
+	_inertia_enabled      = bool(sett.get_setting("inertia_enabled"))
+	zoom_to_cursor        = bool(sett.get_setting("zoom_to_cursor"))
+	_pose_reset_delay     = float(sett.get_setting("pose_reset_delay"))
+	_model_cache_limit    = int(sett.get_setting("model_cache_limit"))
 
 func _get_transformed_aabb(mesh_instance: MeshInstance3D) -> AABB:
 	var local_aabb := mesh_instance.get_aabb()
@@ -369,6 +437,17 @@ func _get_model_aabb(model: Node3D) -> Dictionary:
 				has_mesh = true
 			else:
 				combined_aabb = combined_aabb.merge(mesh_aabb)
+		elif child is Skeleton3D:
+			# Skinned meshes store vertices at bind-pose origin; bone world positions
+			# reflect where the mesh actually appears, so expand AABB with them.
+			var skeleton := child as Skeleton3D
+			for i in range(skeleton.get_bone_count()):
+				var bone_pos: Vector3 = skeleton.global_transform * skeleton.get_bone_global_pose(i).origin
+				if !has_mesh:
+					combined_aabb = AABB(bone_pos, Vector3.ZERO)
+					has_mesh = true
+				else:
+					combined_aabb = combined_aabb.expand(bone_pos)
 
 	return {
 		"has_mesh": has_mesh,
@@ -383,7 +462,7 @@ func _get_aabb_max_axis(aabb: AABB) -> float:
 func load_in_preview_portal(model_path: String) -> String:
 	loading_stage.emit("Очистка сцены...")
 	clear_model()
-
+	_current_model_path = model_path
 	var ext := model_path.get_extension().to_upper()
 	loading_stage.emit("Чтение %s — %s..." % [ext, model_path.get_file()])
 	var model = load_model_from_path(model_path)
@@ -391,12 +470,18 @@ func load_in_preview_portal(model_path: String) -> String:
 		loading_stage.emit("Ошибка загрузки")
 		print("Failed to load model")
 		return "Ошибка загрузки модели"
+	return _setup_loaded_model(model)
 
+
+## Scene-side work that runs on the main thread after the model node is ready.
+## Called both by the synchronous path and by finish_async_load().
+func _setup_loaded_model(model: Node3D) -> String:
 	loading_stage.emit("Добавление в сцену...")
 	current_model = model
 	preview_viewport.add_child(current_model)
-
-	current_model.transform = Transform3D.IDENTITY
+	# Reset only the translation — preserve the import rotation and scale so
+	# skinned characters stay upright and unit-conversion scales are kept.
+	current_model.position = Vector3.ZERO
 
 	loading_stage.emit("Настройка камеры...")
 	var aabb_info := _get_model_aabb(current_model)
@@ -404,9 +489,12 @@ func load_in_preview_portal(model_path: String) -> String:
 		var total_aabb: AABB = aabb_info["aabb"]
 		var model_extent := _get_aabb_max_axis(total_aabb)
 
-		if model_extent > 1000.0 or model_extent < 0.001:
+		if model_extent > 1000.0 or model_extent < 0.5:
 			var target_extent := 5.0
-			current_model.scale = Vector3.ONE * (target_extent / max(model_extent, 0.0001))
+			# Multiply the existing scale uniformly — don't replace it, so
+			# the original import rotation/scale basis is preserved.
+			var factor: float = target_extent / max(model_extent, 0.0001)
+			current_model.scale = current_model.scale * factor
 			aabb_info = _get_model_aabb(current_model)
 			total_aabb = aabb_info["aabb"]
 			model_extent = _get_aabb_max_axis(total_aabb)
@@ -415,25 +503,42 @@ func load_in_preview_portal(model_path: String) -> String:
 		current_model.global_position -= center
 		orbit_center = Vector3.ZERO
 
-		if !saved_settings_loaded:
-			camera_horizontal_angle = 0.0
-			camera_vertical_angle = PI / 4
-			camera_distance = max(model_extent * 2.0, 2.0)
-			is_rotating = true
-			auto_rotation_speed = 0.5
-			initial_auto_rotation_speed = auto_rotation_speed
-			saved_settings_loaded = true
-		else:
-			camera_horizontal_angle = owner.settings.get_setting("camera_horizontal_angle")
-			camera_vertical_angle = owner.settings.get_setting("camera_vertical_angle")
-			camera_distance = owner.settings.get_setting("camera_distance")
-			is_rotating = owner.settings.get_setting("auto_rotation")
-			initial_auto_rotation_speed = owner.settings.get_setting("rotation_speed")
-			auto_rotation_speed = initial_auto_rotation_speed if is_rotating else 0.0
+		# Always compute a well-framed view for this specific model.
+		# Project the AABB onto the actual camera plane so a long-but-narrow
+		# model doesn't push the camera as far as a cube of the same max axis.
+		var H := deg_to_rad(30.0)   # 30° horizontal: slight 3/4 turn
+		var V := deg_to_rad(50.0)   # 50° from zenith: slightly above eye level
 
-		var min_distance: float = maxf(model_extent * 0.5, 0.1)
-		var max_distance: float = maxf(model_extent * 10.0, min_distance + 1.0)
-		camera_distance = clamp(camera_distance, min_distance, max_distance)
+		# Unit vector from model centre toward the camera
+		var to_cam := Vector3(sin(H) * sin(V), cos(V), cos(H) * sin(V))
+		# Camera screen-space basis in world coordinates
+		var cam_r  := Vector3.UP.cross(to_cam).normalized()
+		var cam_u  := to_cam.cross(cam_r).normalized()
+
+		# Support-function half-extents: how far the AABB reaches on each axis
+		var he    := total_aabb.size * 0.5
+		var p_w   := absf(he.x * cam_r.x) + absf(he.y * cam_r.y) + absf(he.z * cam_r.z)
+		var p_h   := absf(he.x * cam_u.x) + absf(he.y * cam_u.y) + absf(he.z * cam_u.z)
+
+		# Fit distance using both vertical and horizontal FOV (camera.fov = 45°)
+		var v_half   := deg_to_rad(45.0) * 0.5
+		var vp_size: Vector2i = preview_viewport.size
+		var h_half   := atan(tan(v_half) * vp_size.x / maxf(float(vp_size.y), 1.0))
+		var fit_dist := maxf(p_h / tan(v_half), p_w / tan(h_half))
+		camera_distance         = maxf(fit_dist * 1.3, 0.1)
+		camera_horizontal_angle = H
+		camera_vertical_angle   = V
+
+		if !saved_settings_loaded:
+			is_rotating              = true
+			auto_rotation_speed      = 0.5
+			initial_auto_rotation_speed = 0.5
+			saved_settings_loaded    = true
+		else:
+			is_rotating              = owner.settings.get_setting("auto_rotation")
+			initial_auto_rotation_speed = owner.settings.get_setting("rotation_speed")
+			auto_rotation_speed      = initial_auto_rotation_speed if is_rotating else 0.0
+
 		update_camera_position()
 
 	if owner and owner.settings:
@@ -443,7 +548,6 @@ func load_in_preview_portal(model_path: String) -> String:
 
 	_update_grid()
 
-	# Restore wireframe mode for newly loaded model
 	if wireframe_mode == 1:
 		loading_stage.emit("Построение wireframe...")
 		_build_wireframe_overlay()
@@ -451,8 +555,102 @@ func load_in_preview_portal(model_path: String) -> String:
 		if preview_viewport:
 			preview_viewport.debug_draw = Viewport.DEBUG_DRAW_WIREFRAME
 
-	loading_stage.emit("")   # clear — caller sets the "done" message
+	_model_initial_basis = current_model.transform.basis
+	loading_stage.emit("")
 	return "Модель загружена успешно"
+
+
+# ── Async (threaded) loading API ──────────────────────────────────────────────
+
+## Clear scene, emit stage signals, then start a background thread that runs
+## load_model_from_path(). Returns immediately — poll with poll_async_load().
+func start_load_async(model_path: String) -> void:
+	loading_stage.emit("Очистка сцены...")
+	clear_model()
+	_current_model_path = model_path
+	var ext := model_path.get_extension().to_upper()
+	loading_stage.emit("Чтение %s — %s..." % [ext, model_path.get_file()])
+	_async_result = null
+	_async_thread  = Thread.new()
+	_async_thread.start(_thread_load_model.bind(model_path))
+
+
+func _thread_load_model(model_path: String) -> void:
+	_async_result = load_model_from_path(model_path)
+
+
+## Poll from _process(). Returns -1 while loading, 0 on success, 1 on error.
+func poll_async_load() -> int:
+	if not _async_thread:
+		return 1
+	if _async_thread.is_alive():
+		return -1
+	_async_thread.wait_to_finish()
+	_async_thread = null
+	return 0 if _async_result != null else 1
+
+
+## Call once poll_async_load() returns 0. Adds model to scene on the main thread.
+func finish_async_load() -> String:
+	var model = _async_result
+	_async_result = null
+	if not model:
+		loading_stage.emit("Ошибка загрузки")
+		return "Ошибка загрузки модели"
+	return _setup_loaded_model(model)
+
+
+# ── Cache API ─────────────────────────────────────────────────────────────────
+
+func has_cached(path: String) -> bool:
+	return _model_cache.has(path)
+
+
+## Restore a previously loaded model from cache. No file I/O — instant.
+func load_from_cache(path: String) -> String:
+	loading_stage.emit("Очистка сцены...")
+	clear_model()
+	_current_model_path = path
+	var model: Node3D = _model_cache[path]
+	_model_cache.erase(path)
+	return _setup_loaded_model(model)
+
+
+func remove_from_cache(path: String) -> void:
+	if _model_cache.has(path):
+		_free_model_node(_model_cache[path])
+		_model_cache.erase(path)
+
+
+func get_missing_textures() -> Array[String]:
+	return _missing_textures.duplicate()
+
+
+func set_extra_texture_dirs(dirs: Array[String]) -> void:
+	_extra_texture_dirs = dirs
+
+
+func _find_in_extra_dirs(filename: String) -> String:
+	for dir_path in _extra_texture_dirs:
+		if dir_path.is_empty() or not DirAccess.dir_exists_absolute(dir_path):
+			continue
+		var candidate := dir_path.path_join(filename)
+		if FileAccess.file_exists(candidate):
+			return candidate
+		var da := DirAccess.open(dir_path)
+		if not da:
+			continue
+		da.list_dir_begin()
+		var entry := da.get_next()
+		while entry != "":
+			if da.current_is_dir() and not entry.begins_with("."):
+				var sub := dir_path.path_join(entry).path_join(filename)
+				if FileAccess.file_exists(sub):
+					da.list_dir_end()
+					return sub
+			entry = da.get_next()
+		da.list_dir_end()
+	return ""
 
 func load_mtl_file(mtl_path: String) -> Dictionary:
 	var materials = {}
@@ -936,6 +1134,8 @@ func _prepare_gltf_for_loading(path: String) -> String:
 	var fallback_texture_path := _get_or_create_fallback_texture_path(cache_dir)
 	var changed := false
 
+	_missing_textures.clear()
+
 	var images: Array = gltf_data.get("images", [])
 	for i in range(images.size()):
 		if typeof(images[i]) != TYPE_DICTIONARY:
@@ -950,7 +1150,13 @@ func _prepare_gltf_for_loading(path: String) -> String:
 			continue
 
 		var resolved_image_path := _resolve_external_asset_path(image_uri, base_path, true)
+
+		# If not found via standard paths, search extra texture directories
 		if resolved_image_path.is_empty():
+			resolved_image_path = _find_in_extra_dirs(image_uri.get_file())
+
+		if resolved_image_path.is_empty():
+			_missing_textures.append(image_uri.get_file())
 			if fallback_texture_path.is_empty():
 				push_warning("glTF texture not found and fallback texture could not be created: " + image_uri)
 				continue
@@ -1434,8 +1640,8 @@ func fix_materials(model: Node3D):
 			override_material.cull_mode = BaseMaterial3D.CULL_DISABLED
 			child.set_surface_override_material(0, override_material)
 			
-func clear_model():
-	# ── Reset animation state BEFORE freeing the model ────────────────────────
+func clear_model() -> void:
+	# ── Reset animation state BEFORE detaching the model ──────────────────────
 	if current_animation_player and is_instance_valid(current_animation_player):
 		if current_animation_player.animation_finished.is_connected(_on_animation_finished):
 			current_animation_player.animation_finished.disconnect(_on_animation_finished)
@@ -1453,28 +1659,37 @@ func clear_model():
 		timeline_slider.value   = 0.0
 	if _grid_instance:
 		_grid_instance.visible = false
-	# Reset wireframe overlay and mesh isolation before freeing model
 	_remove_wireframe_overlay()
 	_isolated_mesh_name = ""
 
 	if current_model:
-		for child in _get_all_children(current_model):
-			if child is MeshInstance3D:
-				var mesh = child.mesh
-				if mesh:
-					for i in range(mesh.get_surface_count()):
-						var surface_mat = mesh.surface_get_material(i)
-						if surface_mat and surface_mat is StandardMaterial3D:
-							surface_mat.albedo_texture = null
-							surface_mat.normal_texture = null
-							surface_mat.metallic_texture = null
-							surface_mat.roughness_texture = null
-							mesh.surface_set_material(i, null)
+		var cacheable := not _current_model_path.is_empty() \
+			and not _model_cache.has(_current_model_path)
+		if cacheable:
+			# Detach from scene tree without destroying data
+			preview_viewport.remove_child(current_model)
+			_model_cache[_current_model_path] = current_model
+			# Evict the oldest entry when over the limit
+			if _model_cache.size() > _model_cache_limit:
+				var oldest := _model_cache.keys()[0] as String
+				_free_model_node(_model_cache[oldest])
+				_model_cache.erase(oldest)
+		else:
+			_free_model_node(current_model)
+		current_model        = null
+		_current_model_path  = ""
 
-				child.mesh = null
 
-		current_model.queue_free()
-		current_model = null
+## Release a model node and its GPU resources.
+func _free_model_node(model: Node3D) -> void:
+	for child in _get_all_children(model):
+		if child is MeshInstance3D:
+			var mesh = child.mesh
+			if mesh:
+				for i in range(mesh.get_surface_count()):
+					mesh.surface_set_material(i, null)
+			child.mesh = null
+	model.queue_free()
 
 func _on_viewport_mouse_entered() -> void:
 	mouse_in_viewport = true
@@ -1487,88 +1702,96 @@ func _on_viewport_mouse_exited() -> void:
 func _input(event: InputEvent) -> void:
 	if !current_model:
 		return
-		
+
 	if event.is_action_pressed("toggle_rotation"):
 		toggle_rotation()
 		get_viewport().set_input_as_handled()
-		
+
 	if !mouse_in_viewport:
 		return
-		
-	if event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_LEFT:
-			is_dragging = event.pressed
-			dragging = is_dragging
-			if is_dragging:
-				last_mouse_position = event.position
-				if is_rotating:
-					auto_rotation_speed = 0.0
-			else:
-				if is_rotating:
-					auto_rotation_speed = initial_auto_rotation_speed
-				
-		elif event.button_index == MOUSE_BUTTON_WHEEL_UP and mouse_in_viewport:
-			_do_zoom(true, event.position)
-			get_viewport().set_input_as_handled()
 
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and mouse_in_viewport:
-			_do_zoom(false, event.position)
-			get_viewport().set_input_as_handled()
-			
-	elif event is InputEventMouseMotion and is_dragging:
-		var delta = event.position - last_mouse_position
-		
-		camera_horizontal_angle -= delta.x * 0.005
-		camera_vertical_angle = clamp(
-			camera_vertical_angle - delta.y * 0.005,
-			0.1,
-			PI - 0.1
-		)
-		
-		last_mouse_position = event.position
-		update_camera_position()
-
-func _unhandled_input(event: InputEvent) -> void:
-	if !current_model or !mouse_in_viewport:
-		return
-	
 	if event is InputEventMouseButton:
 		match event.button_index:
-			MOUSE_BUTTON_MIDDLE:
-				middle_mouse_pressed = event.pressed
-				if middle_mouse_pressed:
+			MOUSE_BUTTON_LEFT:
+				is_dragging = event.pressed
+				dragging    = is_dragging
+				if is_dragging:
 					last_mouse_position = event.position
-					Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+					_orbit_velocity     = Vector2.ZERO
+					_last_orbit_delta   = Vector2.ZERO
+					if is_rotating:
+						auto_rotation_speed = 0.0
 				else:
-					Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-					
+					_orbit_velocity = _last_orbit_delta * 60.0 if _inertia_enabled else Vector2.ZERO
+					if is_rotating:
+						auto_rotation_speed = initial_auto_rotation_speed
+				if event.double_click:
+					fit_to_view()
+					is_dragging = false
+					dragging    = false
+					get_viewport().set_input_as_handled()
+			MOUSE_BUTTON_MIDDLE:
+				if event.double_click:
+					middle_mouse_pressed = false
+					_pan_velocity        = Vector2.ZERO
+					_last_pan_delta      = Vector2.ZERO
+					fit_to_view()
+					get_viewport().set_input_as_handled()
+				elif event.pressed:
+					middle_mouse_pressed = true
+					last_mouse_position  = event.position
+					_pan_velocity        = Vector2.ZERO
+					_last_pan_delta      = Vector2.ZERO
+				else:
+					middle_mouse_pressed = false
+					_pan_velocity = _last_pan_delta * 60.0 if _inertia_enabled else Vector2.ZERO
+			MOUSE_BUTTON_RIGHT:
+				if event.double_click:
+					_right_mouse_pressed = false
+					_free_rot_velocity   = Vector2.ZERO
+					_last_free_delta     = Vector2.ZERO
+					if current_model:
+						current_model.transform.basis = _model_initial_basis
+					get_viewport().set_input_as_handled()
+				elif event.pressed:
+					_right_mouse_pressed = true
+					last_mouse_position  = event.position
+					_free_rot_velocity   = Vector2.ZERO
+					_last_free_delta     = Vector2.ZERO
+				else:
+					_right_mouse_pressed = false
+					_free_rot_velocity   = _last_free_delta * 60.0 if _inertia_enabled else Vector2.ZERO
 			MOUSE_BUTTON_WHEEL_UP:
-				if mouse_in_viewport:
-					_do_zoom(true, event.position)
-					get_viewport().set_input_as_handled()
-
+				_do_zoom(true, event.position)
+				get_viewport().set_input_as_handled()
 			MOUSE_BUTTON_WHEEL_DOWN:
-				if mouse_in_viewport:
-					_do_zoom(false, event.position)
-					get_viewport().set_input_as_handled()
-					
+				_do_zoom(false, event.position)
+				get_viewport().set_input_as_handled()
+
 	elif event is InputEventMouseMotion:
 		if middle_mouse_pressed:
-			var delta: Vector2 = event.relative
 			var cam_basis: Basis = preview_camera.global_transform.basis
-			orbit_center -= cam_basis.x * delta.x * camera_pan_speed * 0.01
-			orbit_center += cam_basis.y * delta.y * camera_pan_speed * 0.01
+			orbit_center -= cam_basis.x * event.relative.x * camera_pan_speed * 0.01
+			orbit_center += cam_basis.y * event.relative.y * camera_pan_speed * 0.01
+			_last_pan_delta = event.relative
 			update_camera_position()
-			
-		elif dragging:
-			camera_sensitivity = 0.003
-			camera_horizontal_angle -= event.relative.x * camera_sensitivity
-			camera_vertical_angle = clamp(
-				camera_vertical_angle - event.relative.y * camera_sensitivity,
-				0.1,
-				PI - 0.1
-			)
+		elif _right_mouse_pressed and current_model:
+			var cam_basis: Basis = preview_camera.global_transform.basis
+			var dh: float = event.relative.x * _free_rot_sensitivity
+			var dv: float = event.relative.y * _free_rot_sensitivity
+			current_model.rotate(Vector3.UP, -dh)
+			current_model.rotate(cam_basis.x, -dv)
+			_last_free_delta = Vector2(dh, dv)
+		elif is_dragging:
+			var dh: float = event.relative.x * _orbit_sensitivity
+			var dv: float = event.relative.y * _orbit_sensitivity
+			camera_horizontal_angle -= dh
+			camera_vertical_angle = clamp(camera_vertical_angle - dv, 0.1, PI - 0.1)
+			_last_orbit_delta = Vector2(dh, dv)
 			update_camera_position()
+
+func _unhandled_input(_event: InputEvent) -> void:
+	pass
 
 func get_model_min_distance() -> float:
 	var model_size = get_model_size()
@@ -1761,6 +1984,7 @@ func play_animation(animation_name: String, player: AnimationPlayer):
 	current_animation        = animation_name
 	animation_speed_scale    = 1.0
 	player.speed_scale       = 1.0
+	_anim_reset_gen         += 1
 
 	# Connect animation_finished so the button resets when clip ends
 	if not player.animation_finished.is_connected(_on_animation_finished):
@@ -1798,6 +2022,29 @@ func _on_animation_finished(anim_name: String) -> void:
 	is_playing = false
 	if play_pause_button:
 		play_pause_button.text = "▶"
+	if timeline_slider:
+		_timeline_updating    = true
+		timeline_slider.value = 0.0
+		_timeline_updating    = false
+	_anim_reset_gen += 1
+	_schedule_pose_reset(_anim_reset_gen)
+
+
+func _schedule_pose_reset(gen: int) -> void:
+	await get_tree().create_timer(max(0.0, _pose_reset_delay)).timeout
+	# Cancel if: user started/replayed any animation since this timer was launched
+	if gen != _anim_reset_gen or is_playing:
+		return
+	var player := current_animation_player
+	if not player or not is_instance_valid(player):
+		return
+	# Restore rest pose: use the RESET track if the GLB exported one, else plain stop()
+	if player.has_animation("RESET"):
+		player.play("RESET")
+		player.seek(0.0, true)
+		player.stop(true)
+	else:
+		player.stop()
 	if timeline_slider:
 		_timeline_updating    = true
 		timeline_slider.value = 0.0
@@ -1880,8 +2127,8 @@ func update_camera_position() -> void:
 	preview_camera.look_at(orbit_center)
 	
 	var model_size := get_model_size()
-	preview_camera.near = model_size * 0.01
-	preview_camera.far = model_size * 100.0
+	preview_camera.near = model_size * 0.001
+	preview_camera.far = model_size * 5000.0
 	
 	if owner and owner.settings:
 		owner.settings.set_setting("camera_horizontal_angle", camera_horizontal_angle)
@@ -2388,14 +2635,23 @@ func _do_zoom(zoom_in: bool, mouse_pos: Vector2) -> void:
 	var old_dist   := camera_distance
 
 	if zoom_in:
-		camera_distance = max(model_size * 0.1, camera_distance / zoom_speed)
+		camera_distance = max(model_size * 0.01, camera_distance / zoom_speed)
 	else:
-		camera_distance = min(model_size * 20.0, camera_distance * zoom_speed)
+		camera_distance = min(model_size * 500.0, camera_distance * zoom_speed)
 
-	if zoom_to_cursor and preview_camera:
-		var dist_change := camera_distance - old_dist
-		var ray_dir: Vector3 = preview_camera.project_ray_normal(mouse_pos)
-		orbit_center    -= ray_dir * dist_change * 0.45
+	if zoom_to_cursor and preview_camera and preview_viewport:
+		# mouse_pos is in window/main-viewport space.
+		# project_ray_normal() needs SubViewport-local pixels.
+		# Convert by subtracting the container's screen position and scaling.
+		var rect     := get_global_rect()
+		var vp_mouse := mouse_pos
+		if rect.size.x > 0.0 and rect.size.y > 0.0:
+			var vp_size := Vector2(preview_viewport.size)
+			vp_mouse = (mouse_pos - rect.position) / rect.size * vp_size
+
+		var ray_dir: Vector3    = preview_camera.project_ray_normal(vp_mouse)
+		var to_cam_dir: Vector3 = (preview_camera.global_position - orbit_center).normalized()
+		orbit_center += (old_dist - camera_distance) * (to_cam_dir + ray_dir)
 
 	update_camera_position()
 

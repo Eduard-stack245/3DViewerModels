@@ -1,5 +1,7 @@
 extends Panel
 
+signal textures_action_requested
+
 var content_root: VBoxContainer = null
 var file_name_label: Label = null
 var type_label: Label = null
@@ -16,6 +18,8 @@ var materials_container: VBoxContainer = null
 var textures_container: VBoxContainer = null
 var animations_container: VBoxContainer = null
 var meshes_container: VBoxContainer = null
+
+var textures_action_btn: Button = null
 
 var current_material_preview: Window = null
 var animation_player: AnimationPlayer = null
@@ -38,6 +42,7 @@ func _ready() -> void:
 	_create_dimensions_label()
 	_create_path_copy_button()
 	_create_meshes_section()
+	_create_section_action_buttons()
 	setup_ui()
 	clear_info()
 
@@ -420,6 +425,33 @@ func _create_path_copy_button() -> void:
 	# Place directly after PathLabel
 	if path_label.get_parent() == content_root:
 		content_root.move_child(copy_btn, path_label.get_index() + 1)
+
+
+func _create_section_action_buttons() -> void:
+	var base := "ScrollContainer/VBoxContainer"
+
+	# ── Текстуры: action button ──────────────────────────────────────────────
+	var tex_sec := get_node_or_null(base + "/TexturesSection") as VBoxContainer
+	if tex_sec:
+		textures_action_btn = Button.new()
+		textures_action_btn.name                  = "TexturesActionBtn"
+		textures_action_btn.text                  = "📁 Папка текстур..."
+		textures_action_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		textures_action_btn.pressed.connect(func() -> void: textures_action_requested.emit())
+		tex_sec.add_child(textures_action_btn)
+		# Place right after the header label (index 0)
+		tex_sec.move_child(textures_action_btn, 1)
+
+
+func update_textures_warning(missing_count: int) -> void:
+	if not textures_action_btn:
+		return
+	if missing_count > 0:
+		textures_action_btn.text     = "⚠ Папка текстур (%d пропущено)" % missing_count
+		textures_action_btn.modulate = Color(1.6, 0.75, 0.2)
+	else:
+		textures_action_btn.text     = "📁 Папка текстур..."
+		textures_action_btn.modulate = Color.WHITE
 
 
 func _create_meshes_section() -> void:

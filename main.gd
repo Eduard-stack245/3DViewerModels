@@ -69,6 +69,10 @@ var _lp_drag_active:   bool = false
 var _lp_resize_active: bool = false
 
 # ── Batch operations state ───────────────────────────────────────────────────
+var _settings_win:          Window = null
+var _settings_win_last_tab: int    = 0
+var _miss_tex_dialog:       Window = null
+
 var _batch_win:       Window       = null
 var _batch_mode:      int          = 0        # 0 = screenshots, 1 = export info
 var _batch_checks:    Array        = []       # Array[CheckBox]
@@ -98,14 +102,18 @@ var _tab_fav_btn:  Button = null
 var _status_label:       Label  = null
 var _status_busy_text:   String = ""
 
-# ── Progress popup window ──────────────────────────────────────────────────────
-const PROGRESS_THRESHOLD_MS := 250   # don't show window for ops faster than this
+# ── Progress overlay (CanvasLayer panel, not a separate OS window) ────────────
+const PROGRESS_THRESHOLD_MS := 250   # don't show for ops faster than this (ms)
 
-var _prog_win:         Window      = null
-var _progress_bar:     ProgressBar = null   # bar inside _prog_win
-var _prog_stage_label: Label       = null   # current-stage text inside window
-var _prog_pct_label:   Label       = null   # "55%" text inside window
+var _prog_overlay:     Control     = null   # PanelContainer on a CanvasLayer
+var _progress_bar:     ProgressBar = null   # bar inside the overlay
+var _prog_stage_label: Label       = null   # current-stage text
+var _prog_pct_label:   Label       = null   # "55%"
 var _op_start_msec:    int         = 0      # Time.get_ticks_msec() when op began
+
+# ── Async load state (polled in _process) ─────────────────────────────────────
+var _loading_path:  String = ""   # non-empty while async load is in flight
+var _loading_index: int    = -1   # filtered_model_paths index being loaded
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -157,6 +165,10 @@ func _ready() -> void:
 	if viewport_container:
 		viewport_container.loading_stage.connect(_on_loading_stage)
 
+	# Connect right-panel action buttons
+	if model_info_panel:
+		model_info_panel.textures_action_requested.connect(_show_missing_textures_dialog)
+
 	call_deferred("_first_layout")
 	print("3DViewModels: ready completed")
 
@@ -166,6 +178,66 @@ func _first_layout() -> void:
 	await get_tree().process_frame
 	_apply_layout(false)
 	print("3DViewModels: first layout completed")
+
+
+## Polls the async model-load thread every frame and handles completion.
+## Uses time-based fake progress (10 → 78 %) so the bar fills smoothly while
+## the thread runs. Post-thread scene setup stages (85/90/96/100 %) are handled
+## by _on_loading_stage() which fires from finish_async_load().
+func _process(_delta: float) -> void:
+	if _loading_path.is_empty():
+		return
+
+	var status := viewport_container.poll_async_load()
+
+	if status == -1:
+		# Thread still running — animate bar with a time-based curve.
+		var elapsed := float(Time.get_ticks_msec() - _op_start_msec) / 1000.0
+		var fake_pct := 10.0 + 70.0 * (1.0 - exp(-elapsed * 0.8))
+		_show_progress(fake_pct)
+		return
+
+	# Thread finished — grab path/index, clear state BEFORE any await so that
+	# subsequent _process() calls short-circuit at the top check above.
+	var path  := _loading_path
+	var idx   := _loading_index
+	_loading_path  = ""
+	_loading_index = -1
+
+	if status == 1:   # thread returned null (load error)
+		_hide_progress()
+		_set_status("⚠  Ошибка загрузки", 10.0)
+		return
+
+	# status == 0: thread succeeded. Do scene setup on the main thread.
+	# finish_async_load emits stage signals (Добавление/Настройка/…) which are
+	# caught by _on_loading_stage and update the bar to 85/90/96/100 %.
+	var result := viewport_container.finish_async_load()
+
+	if result != "Модель загружена успешно":
+		_set_status("⚠  %s" % result, 10.0)
+		_show_message("Ошибка загрузки", result)
+		_show_progress(100.0)
+		await get_tree().create_timer(0.4).timeout
+		_hide_progress()
+		return
+
+	_loaded_model_path = path
+	settings.set_setting("last_model", path)
+	settings.add_recent_model(path)
+	show_model_info(idx)
+	_set_status("✓  " + path.get_file(), 8.0)
+	_update_model_header()
+
+	var captured_path := path
+	var captured_idx  := idx
+	get_tree().create_timer(0.35).timeout.connect(
+		func() -> void: _capture_and_store_thumb(captured_path, captured_idx), CONNECT_ONE_SHOT)
+
+	# Keep bar at 100 % for a short moment so the user sees completion.
+	if _prog_overlay and _prog_overlay.modulate.a >= 1.0:
+		await get_tree().create_timer(0.35).timeout
+	_hide_progress()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,13 +314,21 @@ func _update_right_split() -> void:
 	# window / left-divider changes size.
 	if !content_area or !_split_info_done:
 		return
-	if _layout_mode == LayoutMode.COMPACT:
-		return
 	var ca_w := int(content_area.size.x)
-	var target: int    = _desired_info_w if _desired_info_w > 0 else INFO_W[_layout_mode]
-	var new_offset: int = ca_w - target
-	if new_offset > 80 and new_offset < ca_w - 80:
-		content_area.split_offset = new_offset
+	if ca_w <= 0:
+		return
+	# Derive effective mode from actual window width to avoid stale _layout_mode
+	# when this fires mid-frame during rapid resize.
+	var vr := get_viewport().get_visible_rect() if get_viewport() else Rect2()
+	var win_w := maxf(vr.size.x, size.x)
+	var eff_compact: bool = win_w < BP_COMPACT
+	if eff_compact:
+		content_area.split_offset = ca_w
+		return
+	var eff_mode: LayoutMode = LayoutMode.NARROW if win_w < BP_NARROW else LayoutMode.NORMAL
+	var target: int = _desired_info_w if _desired_info_w > 0 else INFO_W[eff_mode]
+	target = clampi(target, 80, ca_w - 100)
+	content_area.split_offset = ca_w - target
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -353,9 +433,14 @@ func _apply_layout(force_split: bool) -> void:
 		if force_split or !_split_initialised or mode_changed:
 			_set_split_offset(left_w, w, mode_changed)
 			_split_initialised = true
+		elif not _left_panel_collapsed:
+			# Clamp within current window even when mode did not change
+			var max_left := int(w * 0.45)
+			if root_split.split_offset > max_left:
+				root_split.split_offset = max_left
 
 	# ── Right divider (viewport ↔ info panel) ────────────────────────────────
-	if content_area and (!_split_info_done or mode_changed):
+	if content_area:
 		if compact:
 			content_area.split_offset = int(content_area.size.x)
 		else:
@@ -365,8 +450,9 @@ func _apply_layout(force_split: bool) -> void:
 			if mode_changed:
 				_desired_info_w = 0  # Reset on mode change → use default
 			var target := _desired_info_w if _desired_info_w > 0 else info_w
+			target = clampi(target, 80, ca_w - 100)
 			var new_offset := ca_w - target
-			if new_offset > 80:
+			if new_offset >= 100:
 				content_area.split_offset = new_offset
 		_split_info_done = true
 
@@ -375,17 +461,22 @@ func _set_split_offset(ideal: int, window_w: float, clamp_existing: bool) -> voi
 	if !root_split:
 		return
 
+	if _left_panel_collapsed:
+		root_split.split_offset = 28
+		return
+
+	# Upper bound: at most 45 % of window width, and at most 2.5× the ideal
+	var hi := int(minf(float(ideal) * 2.5, window_w * 0.45))
+	hi = maxi(hi, ideal)   # never let hi < lo
+
 	if !_split_initialised:
-		# First time: use the ideal width exactly.
 		root_split.split_offset = ideal
 		return
 
 	if clamp_existing:
 		# Mode changed: pull the divider into a sensible range for the new mode,
 		# but honour whatever position the user had if it already fits.
-		var lo := ideal
-		var hi := int(minf(float(ideal) * 2.5, window_w * 0.5))
-		root_split.split_offset = clampi(root_split.split_offset, lo, hi)
+		root_split.split_offset = clampi(root_split.split_offset, ideal, hi)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -640,19 +731,6 @@ func _create_viewport_toolbar() -> void:
 	)
 	toolbar.add_child(wf_btn)
 
-	# ── Zoom-to-cursor toggle ─────────────────────────────────────────────────
-	var ztc_btn := Button.new()
-	ztc_btn.name           = "ZoomCursorToggleBtn"
-	ztc_btn.text           = "ЗумCursor"
-	ztc_btn.tooltip_text   = "Зум к позиции курсора (вкл/выкл)"
-	ztc_btn.toggle_mode    = true
-	ztc_btn.button_pressed = true   # on by default
-	ztc_btn.toggled.connect(func(_p: bool):
-		if viewport_container:
-			viewport_container.toggle_zoom_to_cursor()
-	)
-	toolbar.add_child(ztc_btn)
-
 	toolbar.add_child(VSeparator.new())
 
 	# ── Screenshot ────────────────────────────────────────────────────────────
@@ -724,21 +802,493 @@ func _create_viewport_toolbar() -> void:
 
 	toolbar.add_child(VSeparator.new())
 
-	# ── FPS counter ───────────────────────────────────────────────────────────
-	var fps_btn := Button.new()
-	fps_btn.name           = "FPSToggleBtn"
-	fps_btn.text           = "FPS"
-	fps_btn.tooltip_text   = "Показать FPS и draw calls"
-	fps_btn.toggle_mode    = true
-	fps_btn.button_pressed = false
-	fps_btn.toggled.connect(func(_p: bool) -> void:
-		if viewport_container:
-			viewport_container.toggle_fps_counter()
-	)
-	toolbar.add_child(fps_btn)
+	# ── Settings ──────────────────────────────────────────────────────────────
+	var sett_btn := Button.new()
+	sett_btn.name         = "SettingsBtn"
+	sett_btn.text         = "⚙"
+	sett_btn.tooltip_text = "Настройки программы"
+	sett_btn.pressed.connect(func() -> void: _open_settings_window())
+	toolbar.add_child(sett_btn)
 
-	preview_column.add_child(toolbar)
+	# Wrap in scroll so buttons don't overflow onto the 3D viewport at small sizes
+	var toolbar_scroll := ScrollContainer.new()
+	toolbar_scroll.name                    = "ToolbarScroll"
+	toolbar_scroll.size_flags_horizontal   = Control.SIZE_EXPAND_FILL
+	toolbar_scroll.size_flags_vertical     = Control.SIZE_SHRINK_BEGIN
+	toolbar_scroll.vertical_scroll_mode   = ScrollContainer.SCROLL_MODE_DISABLED
+	toolbar_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	toolbar_scroll.custom_minimum_size    = Vector2(0, 34)
+	toolbar_scroll.clip_contents          = true
+	toolbar.size_flags_horizontal         = Control.SIZE_SHRINK_BEGIN
+	toolbar_scroll.add_child(toolbar)
+	preview_column.add_child(toolbar_scroll)
+	_apply_startup_display_settings()
 	_create_light_panel()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Startup display settings (grid / gizmo / fps defaults from config)
+# ══════════════════════════════════════════════════════════════════════════════
+func _apply_startup_display_settings() -> void:
+	var pairs := [
+		["GridToggleBtn",  "show_grid",  func(): viewport_container.toggle_grid()],
+		["GizmoToggleBtn", "show_gizmo", func(): viewport_container.toggle_gizmo()],
+	]
+	for pair in pairs:
+		var btn := preview_column.find_child(pair[0] as String, true, false) as Button
+		if btn == null or viewport_container == null:
+			continue
+		var want: bool = bool(settings.get_setting(pair[1] as String))
+		if btn.button_pressed != want:
+			btn.set_pressed_no_signal(want)
+			(pair[2] as Callable).call()
+	if viewport_container:
+		viewport_container.apply_viewer_settings(settings)
+		# Apply show_fps directly — no toolbar button
+		if bool(settings.get_setting("show_fps")):
+			viewport_container.toggle_fps_counter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Settings window
+# ══════════════════════════════════════════════════════════════════════════════
+func _open_settings_window() -> void:
+	if _settings_win and is_instance_valid(_settings_win):
+		_settings_win.show()
+		_settings_win.grab_focus()
+		return
+	_settings_win = _build_settings_window()
+	add_child(_settings_win)
+	var sx: int = int(settings.get_setting("settings_win_x"))
+	var sy: int = int(settings.get_setting("settings_win_y"))
+	var sw: int = int(settings.get_setting("settings_win_w"))
+	var sh: int = int(settings.get_setting("settings_win_h"))
+	if sx >= 0 and sy >= 0:
+		_settings_win.size     = Vector2i(sw, sh)
+		_settings_win.position = Vector2i(sx, sy)
+		_settings_win.show()
+	else:
+		_settings_win.popup_centered()
+
+
+func _sett_slider_row(parent: Control, label_text: String, key: String,
+		min_val: float, max_val: float, step: float, fmt: String) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+
+	var lbl := Label.new()
+	lbl.text = label_text
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	row.add_child(lbl)
+
+	var val_lbl := Label.new()
+	val_lbl.custom_minimum_size = Vector2(52, 0)
+	val_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	val_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	row.add_child(val_lbl)
+
+	var slider := HSlider.new()
+	slider.min_value = min_val
+	slider.max_value = max_val
+	slider.step = step
+	slider.custom_minimum_size = Vector2(150, 0)
+	var cur: float = float(settings.get_setting(key))
+	slider.value = cur
+	val_lbl.text = fmt % cur
+	slider.value_changed.connect(func(v: float) -> void:
+		val_lbl.text = fmt % v
+		settings.set_setting(key, v)
+		if viewport_container:
+			viewport_container.apply_viewer_settings(settings)
+	)
+	row.add_child(slider)
+
+
+func _sett_check_row(parent: Control, label_text: String, key: String) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+
+	var lbl := Label.new()
+	lbl.text = label_text
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	row.add_child(lbl)
+
+	var chk := CheckBox.new()
+	chk.button_pressed = bool(settings.get_setting(key))
+	chk.toggled.connect(func(v: bool) -> void:
+		settings.set_setting(key, v)
+		if viewport_container:
+			viewport_container.apply_viewer_settings(settings)
+			if key == "show_fps" and viewport_container._fps_visible != v:
+				viewport_container.toggle_fps_counter()
+	)
+	row.add_child(chk)
+
+
+func _sett_spinbox_row(parent: Control, label_text: String, key: String,
+		min_val: int, max_val: int, step_val: int) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+
+	var lbl := Label.new()
+	lbl.text = label_text
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	row.add_child(lbl)
+
+	var spin := SpinBox.new()
+	spin.min_value = min_val
+	spin.max_value = max_val
+	spin.step = step_val
+	spin.value = int(settings.get_setting(key))
+	spin.custom_minimum_size = Vector2(80, 0)
+	spin.value_changed.connect(func(v: float) -> void:
+		settings.set_setting(key, int(v))
+		if viewport_container:
+			viewport_container.apply_viewer_settings(settings)
+	)
+	row.add_child(spin)
+
+
+func _build_settings_window() -> Window:
+	var win := Window.new()
+	win.title        = "Настройки"
+	win.exclusive    = false
+	win.unresizable  = false
+	win.min_size     = Vector2i(500, 400)
+	win.size         = Vector2i(520, 480)
+	win.close_requested.connect(func() -> void:
+		settings.set_setting("settings_win_x", win.position.x)
+		settings.set_setting("settings_win_y", win.position.y)
+		settings.set_setting("settings_win_w", win.size.x)
+		settings.set_setting("settings_win_h", win.size.y)
+		win.hide()
+	)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left",   10)
+	margin.add_theme_constant_override("margin_right",  10)
+	margin.add_theme_constant_override("margin_top",     8)
+	margin.add_theme_constant_override("margin_bottom", 10)
+	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	win.add_child(margin)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 8)
+	margin.add_child(vbox)
+
+	var tabs := TabContainer.new()
+	tabs.name = "SettingsTabs"
+	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vbox.add_child(tabs)
+
+	# ── Tab 1: Управление ─────────────────────────────────────────────────
+	var cam_tab := VBoxContainer.new()
+	cam_tab.name = "Управление"
+	cam_tab.add_theme_constant_override("separation", 10)
+	tabs.add_child(cam_tab)
+	cam_tab.add_child(HSeparator.new())
+	_sett_slider_row(cam_tab, "Чувствительность орбиты:",   "orbit_sensitivity",
+			0.0001, 0.030, 0.0001, "%.4f")
+	_sett_slider_row(cam_tab, "Чувствительность вращения:", "free_rotation_sensitivity",
+			0.0001, 0.030, 0.0001, "%.4f")
+	_sett_slider_row(cam_tab, "Скорость зума:",             "zoom_speed",
+			1.05, 2.0, 0.05, "%.2f")
+	_sett_slider_row(cam_tab, "Скорость панорамы:",         "pan_speed",
+			0.2, 10.0, 0.2, "%.1f")
+	_sett_check_row(cam_tab, "Инерция движения (плавное замедление):", "inertia_enabled")
+	_sett_check_row(cam_tab, "Зум к курсору:", "zoom_to_cursor")
+
+	# ── Tab 2: Анимация ───────────────────────────────────────────────────
+	var anim_tab := VBoxContainer.new()
+	anim_tab.name = "Анимация"
+	anim_tab.add_theme_constant_override("separation", 10)
+	tabs.add_child(anim_tab)
+	anim_tab.add_child(HSeparator.new())
+	_sett_slider_row(anim_tab, "Задержка сброса позы (сек):", "pose_reset_delay",
+			0.0, 10.0, 0.5, "%.1f")
+	var anim_note := Label.new()
+	anim_note.text = "После окончания анимации модель возвращается\nв стандартную позу через указанное время.\n0 = сброс немедленно."
+	anim_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	anim_note.modulate.a = 0.65
+	anim_tab.add_child(anim_note)
+
+	# ── Tab 3: Прочее ─────────────────────────────────────────────────────
+	var misc_tab := VBoxContainer.new()
+	misc_tab.name = "Прочее"
+	misc_tab.add_theme_constant_override("separation", 10)
+	tabs.add_child(misc_tab)
+	misc_tab.add_child(HSeparator.new())
+	_sett_check_row(misc_tab, "Показывать сетку при запуске:",   "show_grid")
+	_sett_check_row(misc_tab, "Показывать оси при запуске:",     "show_gizmo")
+	_sett_check_row(misc_tab, "Показывать FPS:",                 "show_fps")
+	_sett_spinbox_row(misc_tab, "Кэш моделей в памяти (шт.):",   "model_cache_limit",
+			1, 32, 1)
+	var misc_note := Label.new()
+	misc_note.text = "Сетка и оси вступают в силу при следующем запуске. FPS включается сразу."
+	misc_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	misc_note.modulate.a = 0.65
+	misc_tab.add_child(misc_note)
+
+	# ── Bottom buttons ────────────────────────────────────────────────────
+	vbox.add_child(HSeparator.new())
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", 8)
+	vbox.add_child(btn_row)
+
+	var reset_btn := Button.new()
+	reset_btn.text = "Сбросить все настройки"
+	reset_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	reset_btn.pressed.connect(func() -> void:
+		if is_instance_valid(win):
+			settings.set_setting("settings_win_x", win.position.x)
+			settings.set_setting("settings_win_y", win.position.y)
+			settings.set_setting("settings_win_w", win.size.x)
+			settings.set_setting("settings_win_h", win.size.y)
+			var tc := win.find_child("SettingsTabs", true, false) as TabContainer
+			if tc:
+				_settings_win_last_tab = tc.current_tab
+		_reset_viewer_settings_to_defaults()
+		if is_instance_valid(win):
+			win.queue_free()
+		_settings_win = null
+		_open_settings_window()
+	)
+	btn_row.add_child(reset_btn)
+
+	var close_btn := Button.new()
+	close_btn.text = "Закрыть"
+	close_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	close_btn.pressed.connect(func() -> void:
+		settings.set_setting("settings_win_x", win.position.x)
+		settings.set_setting("settings_win_y", win.position.y)
+		settings.set_setting("settings_win_w", win.size.x)
+		settings.set_setting("settings_win_h", win.size.y)
+		win.hide()
+	)
+	btn_row.add_child(close_btn)
+
+	# Restore the tab that was active before (e.g. after reset)
+	tabs.current_tab = clampi(_settings_win_last_tab, 0, tabs.get_tab_count() - 1)
+
+	return win
+
+
+func _reset_viewer_settings_to_defaults() -> void:
+	for key: String in ["orbit_sensitivity", "free_rotation_sensitivity",
+			"zoom_speed", "pan_speed", "inertia_enabled", "zoom_to_cursor",
+			"pose_reset_delay", "model_cache_limit",
+			"show_grid", "show_gizmo", "show_fps"]:
+		settings.set_setting(key, settings.DEFAULT_SETTINGS[key])
+	if viewport_container:
+		viewport_container.apply_viewer_settings(settings)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Missing textures indicator and dialog
+# ══════════════════════════════════════════════════════════════════════════════
+func _update_model_header() -> void:
+	# Close stale texture dialog from the previous model
+	if _miss_tex_dialog and is_instance_valid(_miss_tex_dialog):
+		_miss_tex_dialog.queue_free()
+	_miss_tex_dialog = null
+
+	if not viewport_container or not model_info_panel:
+		return
+	var missing_count := viewport_container.get_missing_textures().size()
+	model_info_panel.update_textures_warning(missing_count)
+
+
+func _show_missing_textures_dialog() -> void:
+	if _miss_tex_dialog and is_instance_valid(_miss_tex_dialog):
+		_miss_tex_dialog.show()
+		_miss_tex_dialog.grab_focus()
+		return
+
+	var missing: Array[String] = []
+	if viewport_container:
+		missing = viewport_container.get_missing_textures()
+
+	# Gather embedded/found textures from materials for display
+	var found_textures: Array = []
+	if viewport_container:
+		var details := viewport_container.get_model_details()
+		found_textures = details.get("textures_data", [])
+
+	var win := Window.new()
+	win.title       = "Текстуры модели"
+	win.exclusive   = false
+	win.unresizable = false
+	win.min_size    = Vector2i(420, 300)
+	win.size        = Vector2i(480, 400)
+	win.close_requested.connect(func() -> void: win.hide())
+	_miss_tex_dialog = win
+	add_child(win)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left",   12)
+	margin.add_theme_constant_override("margin_right",  12)
+	margin.add_theme_constant_override("margin_top",    10)
+	margin.add_theme_constant_override("margin_bottom", 12)
+	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	win.add_child(margin)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 8)
+	margin.add_child(vbox)
+
+	# ── Found / embedded textures ─────────────────────────────────────────────
+	if not found_textures.is_empty():
+		var found_hdr := Label.new()
+		found_hdr.text = "Текстуры в модели:"
+		found_hdr.add_theme_font_size_override("font_size", 12)
+		vbox.add_child(found_hdr)
+
+		var found_scroll := ScrollContainer.new()
+		found_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		found_scroll.custom_minimum_size = Vector2(0, 60)
+		vbox.add_child(found_scroll)
+
+		var found_vbox := VBoxContainer.new()
+		found_vbox.add_theme_constant_override("separation", 2)
+		found_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		found_scroll.add_child(found_vbox)
+
+		for tex_info: Dictionary in found_textures:
+			var lbl := Label.new()
+			lbl.text = "✓  " + str(tex_info.get("name", "—"))
+			lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			lbl.modulate = Color(0.6, 1.0, 0.6)
+			found_vbox.add_child(lbl)
+
+		vbox.add_child(HSeparator.new())
+
+	# ── Missing textures ──────────────────────────────────────────────────────
+	var miss_hdr := Label.new()
+	if missing.is_empty():
+		miss_hdr.text = "Пропущенных текстур нет."
+		miss_hdr.modulate.a = 0.65
+	else:
+		miss_hdr.text = "Не найдено текстур (%d):" % missing.size()
+		miss_hdr.modulate = Color(1.6, 0.75, 0.2)
+	miss_hdr.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	vbox.add_child(miss_hdr)
+
+	if not missing.is_empty():
+		var scroll := ScrollContainer.new()
+		scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		scroll.custom_minimum_size = Vector2(0, 60)
+		vbox.add_child(scroll)
+
+		var list_vbox := VBoxContainer.new()
+		list_vbox.add_theme_constant_override("separation", 2)
+		list_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		scroll.add_child(list_vbox)
+
+		for tex_name: String in missing:
+			var lbl := Label.new()
+			lbl.text = "✗  " + tex_name
+			lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			lbl.modulate = Color(1.0, 0.5, 0.4)
+			list_vbox.add_child(lbl)
+
+	vbox.add_child(HSeparator.new())
+
+	# Current folder display
+	var folder_row := HBoxContainer.new()
+	folder_row.add_theme_constant_override("separation", 6)
+	vbox.add_child(folder_row)
+
+	var folder_lbl := Label.new()
+	folder_lbl.text = "Папка текстур:"
+	folder_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	folder_row.add_child(folder_lbl)
+
+	var cur_folder := settings.get_texture_folder(_loaded_model_path)
+	var folder_val := Label.new()
+	folder_val.name = "FolderValueLabel"
+	folder_val.text = cur_folder if not cur_folder.is_empty() else "(не задана)"
+	folder_val.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	folder_val.clip_text = true
+	folder_val.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	folder_val.modulate.a = 0.75 if cur_folder.is_empty() else 1.0
+	folder_row.add_child(folder_val)
+
+	# Buttons row
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", 8)
+	vbox.add_child(btn_row)
+
+	var pick_btn := Button.new()
+	pick_btn.text = "Указать папку..."
+	pick_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	pick_btn.pressed.connect(func() -> void:
+		_pick_texture_folder(win)
+	)
+	btn_row.add_child(pick_btn)
+
+	var clear_btn := Button.new()
+	clear_btn.text = "Очистить папку"
+	clear_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	clear_btn.pressed.connect(func() -> void:
+		if _loaded_model_path.is_empty():
+			return
+		settings.set_texture_folder(_loaded_model_path, "")
+		if viewport_container:
+			viewport_container.set_extra_texture_dirs([])
+		var val_l := win.find_child("FolderValueLabel", true, false) as Label
+		if val_l:
+			val_l.text      = "(не задана)"
+			val_l.modulate.a = 0.75
+	)
+	btn_row.add_child(clear_btn)
+
+	var close_btn := Button.new()
+	close_btn.text = "Закрыть"
+	close_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	close_btn.pressed.connect(func() -> void: win.hide())
+	btn_row.add_child(close_btn)
+
+	win.popup_centered()
+
+
+func _pick_texture_folder(owner_win: Window) -> void:
+	var fd := FileDialog.new()
+	fd.file_mode      = FileDialog.FILE_MODE_OPEN_DIR
+	fd.access         = FileDialog.ACCESS_FILESYSTEM
+	fd.title          = "Выберите папку с текстурами"
+	if not _loaded_model_path.is_empty():
+		fd.current_dir = _loaded_model_path.get_base_dir()
+	add_child(fd)
+	fd.dir_selected.connect(func(dir: String) -> void:
+		if _loaded_model_path.is_empty():
+			fd.queue_free()
+			return
+		settings.set_texture_folder(_loaded_model_path, dir)
+		# Reload the model so textures are resolved with the new folder
+		var path := _loaded_model_path
+		_loaded_model_path = ""
+		if viewport_container:
+			viewport_container.remove_from_cache(path)
+		# Update folder label in the dialog if it's still open
+		if is_instance_valid(owner_win):
+			var val_l := owner_win.find_child("FolderValueLabel", true, false) as Label
+			if val_l:
+				val_l.text       = dir
+				val_l.modulate.a = 1.0
+		# Trigger reload
+		var midx := filtered_model_paths.find(path)
+		if midx != -1:
+			_on_model_selected(midx)
+		fd.queue_free()
+	)
+	fd.canceled.connect(func() -> void: fd.queue_free())
+	fd.popup_centered(Vector2i(800, 550))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1314,39 +1864,52 @@ func _on_model_selected(index: int) -> void:
 	if index < 0 or index >= filtered_model_paths.size():
 		return
 
+	# If another async load is already in flight, ignore the new click.
+	if not _loading_path.is_empty():
+		return
+
 	var model_path := filtered_model_paths[index]
 	var file_name  := model_path.get_file()
 
+	# Already showing this exact model — nothing to do.
+	if model_path == _loaded_model_path:
+		return
+
+	# Apply per-model extra texture search dirs before any load path
+	var _tex_folder := settings.get_texture_folder(model_path)
+	var _tex_dirs: Array[String] = []
+	if not _tex_folder.is_empty():
+		_tex_dirs.append(_tex_folder)
+	viewport_container.set_extra_texture_dirs(_tex_dirs)
+
+	# ── Cache hit: instant restore, no thread needed ──────────────────────────
+	if viewport_container.has_cached(model_path):
+		_op_start_msec = Time.get_ticks_msec()   # keep threshold clock fresh so bar stays hidden
+		var result := viewport_container.load_from_cache(model_path)
+		if result != "Модель загружена успешно":
+			_set_status("⚠  %s" % result, 10.0)
+			_show_message("Ошибка загрузки", result)
+		else:
+			_loaded_model_path = model_path
+			settings.set_setting("last_model", model_path)
+			settings.add_recent_model(model_path)
+			show_model_info(index)
+			_set_status("✓  " + file_name, 8.0)
+			_update_model_header()
+			var cp := model_path; var ci := index
+			get_tree().create_timer(0.1).timeout.connect(
+				func() -> void: _capture_and_store_thumb(cp, ci), CONNECT_ONE_SHOT)
+		return
+
+	# ── Cache miss: start threaded async load ─────────────────────────────────
 	_set_status("⏳ Загрузка %s..." % file_name)
-	if _prog_win:
-		_prog_win.title = "Загрузка: " + file_name
-	if _prog_stage_label:
-		_prog_stage_label.text = "⏳ Загрузка %s..." % file_name
-	_op_start_msec = Time.get_ticks_msec()   # start the threshold clock
+	_op_start_msec = Time.get_ticks_msec()
+	_loading_path  = model_path
+	_loading_index = index
 
-	var result := viewport_container.load_in_preview_portal(model_path)
-
-	# Only flash 100% + wait if the window actually opened (slow load).
-	if _prog_win and _prog_win.visible:
-		_show_progress(100.0)
-		await get_tree().create_timer(0.35).timeout
-	_hide_progress()
-
-	if result != "Модель загружена успешно":
-		_set_status("⚠  %s" % result, 10.0)
-		_show_message("Ошибка загрузки", result)
-	else:
-		_loaded_model_path = model_path
-		settings.set_setting("last_model", model_path)
-		settings.add_recent_model(model_path)
-		show_model_info(index)
-		# Capture thumbnail after a short delay so the viewport has rendered
-		var captured_path: String = model_path
-		var captured_idx:  int    = index
-		get_tree().create_timer(0.35).timeout.connect(
-			func() -> void: _capture_and_store_thumb(captured_path, captured_idx), CONNECT_ONE_SHOT)
-		# Show success status with file name — auto-clears after 8 s
-		_set_status("✓  " + file_name, 8.0)
+	# start_load_async emits "Очистка" and "Чтение" stage signals synchronously,
+	# then spawns a Thread for the slow file I/O and returns immediately.
+	viewport_container.start_load_async(model_path)
 
 
 func _on_model_list_item_clicked(index: int, _at_pos: Vector2, mouse_button: int) -> void:
@@ -1790,8 +2353,6 @@ func scan_project_models(path: String) -> void:
 	_scan_depth += 1
 	if _scan_depth == 1:
 		_set_status("🔍 Сканирование %s..." % path.get_file())
-		if _prog_win:
-			_prog_win.title = "Сканирование"
 		if _prog_stage_label:
 			_prog_stage_label.text = "🔍 Сканирование %s..." % path.get_file()
 		_op_start_msec = Time.get_ticks_msec()
@@ -1830,7 +2391,7 @@ func _finish_scan() -> void:
 		model_paths.size(),
 		_plural_models(model_paths.size())
 	], 6.0)
-	if _prog_win and _prog_win.visible:
+	if _prog_overlay and _prog_overlay.modulate.a >= 1.0:
 		_show_progress(100.0)
 		await get_tree().create_timer(0.4).timeout
 	_hide_progress()
@@ -2070,34 +2631,53 @@ func _create_status_bar() -> void:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Progress popup window
+#  Progress overlay  (CanvasLayer panel — same OS window, no jerk)
 # ══════════════════════════════════════════════════════════════════════════════
 func _create_progress_window() -> void:
-	_prog_win = Window.new()
-	_prog_win.title         = "Прогресс"
-	_prog_win.size          = Vector2i(340, 95)
-	_prog_win.min_size      = Vector2i(340, 95)
-	_prog_win.always_on_top = true
-	_prog_win.transient     = true
-	_prog_win.exclusive     = false
-	_prog_win.visible       = false
-	# Prevent the user from closing it mid-operation
-	_prog_win.close_requested.connect(func() -> void: pass)
-	add_child(_prog_win)
+	# A CanvasLayer keeps the overlay inside the same OS window so that
+	# RenderingServer.force_draw() can paint it immediately during a blocking
+	# GDScript call, without needing the OS event loop to pump a new window.
+	var canvas := CanvasLayer.new()
+	canvas.layer = 128
+	add_child(canvas)
 
-	var margin := MarginContainer.new()
-	margin.add_theme_constant_override("margin_left",   10)
-	margin.add_theme_constant_override("margin_right",  10)
-	margin.add_theme_constant_override("margin_top",     8)
-	margin.add_theme_constant_override("margin_bottom",  8)
-	_prog_win.add_child(margin)
+	var panel := PanelContainer.new()
+	panel.name              = "ProgressOverlay"
+	panel.mouse_filter      = Control.MOUSE_FILTER_IGNORE
+	# Anchor to the exact centre of the viewport
+	panel.anchor_left       = 0.5
+	panel.anchor_right      = 0.5
+	panel.anchor_top        = 0.5
+	panel.anchor_bottom     = 0.5
+	panel.offset_left       = -190.0
+	panel.offset_right      =  190.0
+	panel.offset_top        = -48.0
+	panel.offset_bottom     =  48.0
+	panel.modulate          = Color(1, 1, 1, 0)   # invisible until needed
+
+	var ps := StyleBoxFlat.new()
+	ps.bg_color           = Color(0.11, 0.11, 0.14, 0.96)
+	ps.border_color       = Color(0.30, 0.30, 0.36)
+	ps.border_width_left  = 1
+	ps.border_width_right = 1
+	ps.border_width_top   = 1
+	ps.border_width_bottom= 1
+	ps.set_corner_radius_all(6)
+	ps.shadow_color       = Color(0, 0, 0, 0.45)
+	ps.shadow_size        = 6
+	ps.content_margin_left   = 12
+	ps.content_margin_right  = 12
+	ps.content_margin_top    = 8
+	ps.content_margin_bottom = 8
+	panel.add_theme_stylebox_override("panel", ps)
+	canvas.add_child(panel)
+	_prog_overlay = panel
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", 6)
-	margin.add_child(vbox)
+	panel.add_child(vbox)
 
 	_prog_stage_label = Label.new()
-	_prog_stage_label.name                  = "StageLabel"
 	_prog_stage_label.clip_text             = true
 	_prog_stage_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_prog_stage_label.add_theme_font_size_override("font_size", 12)
@@ -2108,26 +2688,24 @@ func _create_progress_window() -> void:
 	vbox.add_child(row)
 
 	_progress_bar = ProgressBar.new()
-	_progress_bar.name                  = "ProgBar"
 	_progress_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_progress_bar.custom_minimum_size   = Vector2(0, 22)
+	_progress_bar.custom_minimum_size   = Vector2(0, 20)
 	_progress_bar.show_percentage       = false
 	_progress_bar.min_value             = 0.0
 	_progress_bar.max_value             = 100.0
 	_progress_bar.value                 = 0.0
 
 	var fill_sb := StyleBoxFlat.new()
-	fill_sb.bg_color = Color(0.15, 0.60, 1.00)   # bright blue fill
+	fill_sb.bg_color = Color(0.15, 0.60, 1.00)   # vivid blue fill
 	_progress_bar.add_theme_stylebox_override("fill", fill_sb)
 
 	var bg_sb := StyleBoxFlat.new()
-	bg_sb.bg_color = Color(0.08, 0.08, 0.10)      # near-black trough
+	bg_sb.bg_color = Color(0.06, 0.06, 0.09)     # near-black trough
 	_progress_bar.add_theme_stylebox_override("background", bg_sb)
 
 	row.add_child(_progress_bar)
 
 	_prog_pct_label = Label.new()
-	_prog_pct_label.name                  = "PctLabel"
 	_prog_pct_label.text                  = "0%"
 	_prog_pct_label.custom_minimum_size.x = 38
 	_prog_pct_label.horizontal_alignment  = HORIZONTAL_ALIGNMENT_RIGHT
@@ -2136,34 +2714,32 @@ func _create_progress_window() -> void:
 	row.add_child(_prog_pct_label)
 
 
-## Show the progress window and set the bar to `value` (0–100).
-## The window only opens if the operation has already taken longer than
-## PROGRESS_THRESHOLD_MS — fast loads never trigger it.
+## Make the overlay visible at `value` percent (0–100).
+## Only becomes visible once PROGRESS_THRESHOLD_MS has elapsed since
+## _op_start_msec was set — fast operations never trigger it.
 func _show_progress(value: float) -> void:
-	if not _prog_win or not _progress_bar:
+	if not _prog_overlay or not _progress_bar:
 		return
 	var clamped := clampf(value, 0.0, 100.0)
 	_progress_bar.value = clamped
 	if _prog_pct_label:
 		_prog_pct_label.text = "%d%%" % int(clamped)
-	# Only open the window once the threshold has been exceeded.
-	if not _prog_win.visible:
+	if _prog_overlay.modulate.a < 1.0:
 		if Time.get_ticks_msec() - _op_start_msec < PROGRESS_THRESHOLD_MS:
-			return   # still fast — silently update value but don't pop up
-		_prog_win.popup_centered()
-	RenderingServer.force_draw()
+			return   # too fast — keep hidden, just track value
+		_prog_overlay.modulate = Color.WHITE
 
 
-## Hide the progress window and reset bar to 0%.
+## Hide the overlay and reset the bar.
 func _hide_progress() -> void:
+	if _prog_overlay:
+		_prog_overlay.modulate = Color(1, 1, 1, 0)
 	if _progress_bar:
 		_progress_bar.value = 0.0
 	if _prog_pct_label:
 		_prog_pct_label.text = "0%"
 	if _prog_stage_label:
 		_prog_stage_label.text = ""
-	if _prog_win:
-		_prog_win.hide()
 
 
 ## Show `text` in the status bar.
@@ -2183,31 +2759,31 @@ func _set_status(text: String, auto_clear_sec: float = 0.0) -> void:
 
 
 ## Receives stage text emitted by view_model during loading.
-## Maps each stage keyword to a progress percentage and forces a visual refresh.
+## Pre-thread stages (Очистка/Чтение) get low %s so the time-based fake
+## progress in _process() takes over. Post-thread stages (Добавление/Настройка/
+## Построение) are always above the fake-progress ceiling (~78%) so the bar
+## never goes backward.
 func _on_loading_stage(text: String) -> void:
 	if not _status_label:
 		return
+
 	if text.is_empty():
-		# Empty = loading finished; the caller sets the final status text.
 		_show_progress(100.0)
-		RenderingServer.force_draw()
 		return
 
 	_status_label.text = text
 	if _prog_stage_label:
 		_prog_stage_label.text = text
 
-	# Map known stage prefixes to progress percentages.
 	var pct: float
 	if   text.begins_with("Очистка"):    pct =  5.0
-	elif text.begins_with("Чтение"):     pct = 25.0
-	elif text.begins_with("Добавление"): pct = 55.0
-	elif text.begins_with("Настройка"):  pct = 82.0
-	elif text.begins_with("Построение"): pct = 93.0
+	elif text.begins_with("Чтение"):     pct = 10.0
+	elif text.begins_with("Добавление"): pct = 85.0
+	elif text.begins_with("Настройка"):  pct = 90.0
+	elif text.begins_with("Построение"): pct = 96.0
 	elif text.begins_with("Ошибка"):     pct = 100.0
 	else:                                pct = 50.0
 
-	# _show_progress calls force_draw() internally; no extra call needed.
 	_show_progress(pct)
 
 
@@ -2349,33 +2925,9 @@ func _place_thumb_popup() -> void:
 func _capture_and_store_thumb(path: String, list_idx: int) -> void:
 	if !viewport_container or !viewport_container.current_model:
 		return
-
-	# Save current camera state so we can restore it after the snapshot
-	var saved_dist:   float   = viewport_container.camera_distance
-	var saved_horiz:  float   = viewport_container.camera_horizontal_angle
-	var saved_vert:   float   = viewport_container.camera_vertical_angle
-	var saved_center: Vector3 = viewport_container.orbit_center
-
-	# Frame the model properly regardless of where the camera currently is
-	viewport_container.fit_to_view()
-
-	# Wait 2 frames so the GPU renders the updated camera position
-	await get_tree().process_frame
-	await get_tree().process_frame
-
-	# Capture only if the same model is still loaded
-	if !viewport_container.current_model:
-		return
-
+	# Capture whatever is currently rendered — no camera movement needed
+	# (the viewport has already rendered the model by the time this runs).
 	var tex: ImageTexture = viewport_container.capture_thumbnail(Vector2i(128, 128))
-
-	# Restore camera silently so the user doesn't see it jump
-	viewport_container.camera_distance          = saved_dist
-	viewport_container.camera_horizontal_angle  = saved_horiz
-	viewport_container.camera_vertical_angle    = saved_vert
-	viewport_container.orbit_center             = saved_center
-	viewport_container.update_camera_position()
-
 	if !tex:
 		return
 	_thumb_cache[path] = tex

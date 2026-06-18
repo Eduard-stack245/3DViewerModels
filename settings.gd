@@ -7,6 +7,21 @@ const DEFAULT_SETTINGS := {
 	"last_model": "",
 	"auto_rotation": true,
 	"rotation_speed": 0.5,
+	"orbit_sensitivity": 0.003,
+	"free_rotation_sensitivity": 0.003,
+	"zoom_speed": 1.2,
+	"pan_speed": 2.0,
+	"inertia_enabled": false,
+	"zoom_to_cursor": false,
+	"pose_reset_delay": 1.0,
+	"model_cache_limit": 8,
+	"show_grid": true,
+	"show_gizmo": true,
+	"show_fps": false,
+	"settings_win_x": -1,
+	"settings_win_y": -1,
+	"settings_win_w": 520,
+	"settings_win_h": 480,
 	"camera_distance": 5.0,
 	"camera_horizontal_angle": 0.0,
 	"camera_vertical_angle": PI / 4,
@@ -24,7 +39,8 @@ const DEFAULT_SETTINGS := {
 	"animation_position": 0.0,
 	"recent_models": "[]",
 	"recent_folders": "[]",
-	"favorites": "[]"
+	"favorites": "[]",
+	"texture_folders": "{}"
 }
 
 var config := ConfigFile.new()
@@ -174,3 +190,23 @@ func remove_favorite(path: String) -> void:
 	if path in favs:
 		favs.erase(path)
 		set_favorites(favs)
+
+
+# ── Texture folders (per-model) ───────────────────────────────────────────────
+func get_texture_folder(model_path: String) -> String:
+	var parsed = JSON.parse_string(str(get_setting("texture_folders")))
+	if not parsed is Dictionary:
+		return ""
+	return str(parsed.get(model_path, ""))
+
+
+func set_texture_folder(model_path: String, folder: String) -> void:
+	var map: Dictionary = {}
+	var parsed = JSON.parse_string(str(get_setting("texture_folders")))
+	if parsed is Dictionary:
+		map = parsed
+	if folder.is_empty():
+		map.erase(model_path)
+	else:
+		map[model_path] = folder
+	set_setting("texture_folders", JSON.stringify(map))
